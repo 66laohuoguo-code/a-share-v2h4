@@ -1,0 +1,74 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+config/portfolio_config.local.json
+config/*secret*
+config/*credential*
+MY_LOCAL_GUIDE.md
+
+# Licensed/raw market data, account data, reports and generated factors
+data/*
+!data/README.md
+!data/input/
+data/input/*
+!data/input/positions.example.csv
+!data/input/account_state.example.json
+
+# Generated research and temporary files
+outputs/
+work/
+*.sqlite
+*.sqlite-*
+*.db
+*.xlsx
+*.xls
+*.pdf
+*.docx
+*.zip
+*.log
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.agents/
+.codex/
+
+# Unrelated local materials that happen to share the workspace root
+24101102437黄子嫚-汉语言文学师范-旅映非遗微度假平台/
+24101102437黄子嫚-汉语言文学师范-旅映非遗微度假平台.zip
+benchmark_plan.docx
+
+# Internal research history and deprecated experiments are not part of the public product
+README_V2.md
+README_portfolio.md
+GITHUB_UPLOAD.md
+analyze_core_satellite.py
+deepseek_event_signals.py
+factor_diagnostics.py
+factor_rank_backtest_v2.py
+factor_rank_backtest_v2_1.py
+factor_rank_backtest_v2_c1_no_industry.py
+factor_rank_backtest_v2e.py
+fetch_event_feeds.py
+financial_reports.py
+historical_deepseek_weekly_signals.py
+import_csmar_forward_quotation.py
+inspect_resset_xlsx.py
+inspect_resset_xlsx_fast.py
+portfolio_rebalance.py
+run_v2_experiments.ps1
+
+# Only the two reproducible public strategy configurations are included
+config/*
+!config/v2h4_strategy.json
+!config/v2h4_scaled_trades_candidate.json
