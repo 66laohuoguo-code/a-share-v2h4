@@ -1,45 +1,44 @@
 # 每周五收盘后的操作
 
-这份文档只讲每周实际要做的事情。正常情况下，不需要单独运行清洗、因子和调仓三个程序，`run_weekly.ps1` 会按顺序全部完成。
+这份文档只描述每周新增前推行情后的标准流程。历史行情数据库已经建立后，不要再用旧历史清洗器处理周文件。
 
-## 一、每周只需要准备三样东西
+## 1. 下载本周前推行情
 
-1. 本周新增的日线行情 Excel。
-2. 券商账户中周五收盘后的真实持仓。
-3. 你一直使用的 SQLite 数据库路径。
+每周文件必须是日行情表，并至少包含：
 
-## 二、下载并放好本周数据
+```text
+TradingDate, Symbol, OpenPrice, ClosePrice, HighPrice, LowPrice,
+Volume, Amount, StateCode, ChangeRatio, TurnoverRate1
+```
 
-周五收盘并等待数据源更新后，下载本周新增的日线数据，放到：
+把文件放入：
 
 ```text
 data/raw/market_data/
 ```
 
-文件名统一写成：
+建议命名：
 
 ```text
-年份_下载日期_序号.xlsx
+YYYY_YYYYMMDD_N.xlsx
 ```
 
-例如本次被拆成两份：
+例如：
 
 ```text
-2026_20260710_1.xlsx
-2026_20260710_2.xlsx
+2026_20260712_1.xlsx
+2026_20260712_2.xlsx
 ```
 
-Excel 内必须继续包含代码、名称、交易日期、昨收、开高低收、成交额、换手率、总回报、资本回报、上市状态、币种和行业等与历史文件相同的字段。
+文件名用于整理和年份筛选，实际交易日期以 `TradingDate` 为准。同一周文件可以与数据库已有日期重叠，程序会更新重复日期并新增后续日期。
 
-## 三、更新真实持仓
+## 2. 更新真实持仓
 
-打开：
+编辑：
 
 ```text
 data/input/positions.csv
 ```
-
-填写周五收盘后券商显示的实际数据：
 
 ```csv
 code,name,shares,cost_price
@@ -48,132 +47,72 @@ code,name,shares,cost_price
 CASH,现金,235000,
 ```
 
-- `shares` 填实际股数。
-- `cost_price` 填券商显示的成本价，只用于核对。
-- `CASH` 行的 `shares` 填可用于买股的现金金额。
-- 已清仓股票直接删除该行。
-- 不要填写尚未成交的委托。
+- 股票行填写实际股数和成本价。
+- `CASH` 行填写可用于买股的现金。
+- 删除已经清仓的股票。
+- 不填写尚未成交的委托。
 
-## 四、运行每周程序
-
-打开 PowerShell，进入项目目录并激活环境：
+## 3. 运行每周流程
 
 ```powershell
 Set-Location "<项目目录>"
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-.\.venv\Scripts\Activate.ps1
+
+powershell.exe `
+  -NoProfile `
+  -ExecutionPolicy Bypass `
+  -File ".\run_weekly.ps1" `
+  -Python ".\.venv\Scripts\python.exe" `
+  -Database ".\data\processed\stock_daily.sqlite" `
+  -SourceDir ".\data\raw\market_data" `
+  -Positions ".\data\input\positions.csv" `
+  -Year (Get-Date).Year
 ```
 
-这里的 `Process` 只对当前 PowerShell 窗口生效，关闭窗口后自动恢复，不会永久修改系统策略。
+程序会自动：
 
-设置你实际使用的数据库。这里只需要把占位符换成自己的文件路径：
+1. 用 `import_csmar_forward_quotation.py` 读取前推行情。
+2. 跳过已经成功导入且没有变化的 Excel。
+3. 以前一有效收盘价为锚点续接周度价格链。
+4. 校验数据库并显示最大交易日。
+5. 读取真实持仓，计算目标组合和订单。
 
-```powershell
-$Database = "<数据库文件路径>"
-```
+正式策略会跳过最小申报数量超出账户预算的候选，继续寻找下一只可买股票；小账户会减少持股数量，并在报告中显示实际持股数、动态单股上限和动态行业上限。
 
-执行完整周流程：
+## 4. 检查最大日期
 
-```powershell
-.\run_weekly.ps1 `
-  -Year (Get-Date).Year `
-  -Database $Database
-```
-
-程序会自动完成：
-
-1. 导入尚未处理的新 Excel。
-2. 更新数据库中的重复日期记录。
-3. 检查数据库质量并打印最大交易日。
-4. 计算本周 V2H4 因子排名。
-5. 读取你的已有持股和现金。
-6. 计算目标股票仓位。
-7. 生成下一交易日调仓建议。
-
-看到下面这行时，日期必须等于本周最后一个交易日：
+必须看到：
 
 ```text
 Database maximum trading date: YYYY-MM-DD
 ```
 
-如果日期不对，立即停止，不要使用这次订单。先检查下载文件是否包含周五数据，再重新导入。
+它必须等于新 Excel 中最后一个实际交易日。如果不一致，不要使用本次订单。
 
-## 五、查看调仓结果
+## 5. 查看和执行订单
 
-打开下面目录中时间最新的 `.xlsx`：
+打开 `outputs/weekly_rebalance_v2h4/` 中最新的 `.xlsx`：
 
-```text
-outputs/weekly_rebalance_v2h4/
-```
+- `summary`：当前仓位、目标仓位、市场状态和警告。
+- `orders`：建议买卖方向与股数。
+- `projected_positions`：假设全部成交后的预计持仓。
 
-只需要重点看两个工作表：
+开盘前重新检查停牌、ST、涨跌停、权限和现金。优先处理卖单，确认卖出资金后再处理买单。程序不会自动连接券商或自动下单。
 
-- `summary`：当前仓位、模型目标仓位、市场状态和警告。
-- `orders`：下一个交易日建议买卖的代码和股数。
-
-`factor_ranking` 是完整排名，平时不需要逐只查看。`projected_positions` 只是按参考价假设全部成交后的结果，不是真实持仓。
-
-出现以下情况时不要直接执行：
-
-- 数据库最大日期不正确。
-- `summary` 提示目标仓位与预计仓位相差很大。
-- 某股票停牌、涨跌停或你没有对应交易权限。
-- 实际可用现金与 `positions.csv` 不一致。
-
-## 六、下一个交易日怎么操作
-
-1. 开盘前重新检查停牌和风险警示状态。
-2. 优先处理 `SELL` 卖单。
-3. 等卖单成交并确认可用现金。
-4. 再处理 `BUY` 买单。
-5. 开盘价与报告参考价差异过大时，不要机械追价。
-
-程序只生成辅助计划，不会自动连接券商或自动下单。
-
-## 七、成交后做什么
-
-以券商的真实成交结果为准，更新 `data/input/positions.csv`：
-
-- 改成实际成交后的股数。
-- 更新实际可用现金。
-- 更新成本价。
-- 删除已经清仓的股票。
-
-下周五再次重复本文件的步骤即可。
-
-## 八、运行修正后的完整回测
-
-修正版会处理历史税费、送转股、现金分红、不同板块申报数量和交易门槛。数据库最大日期会自动作为回测结束日期：
+## 6. 文件格式出错时先干跑
 
 ```powershell
-$Database = "<数据库文件路径>"
-
-.\run_v2h4_validation.ps1 `
-  -Database $Database `
-  -StartDate 2021-01-05 `
-  -IncludeStress
+python import_csmar_forward_quotation.py `
+  --source-xlsx "data/raw/market_data/YYYY_YYYYMMDD_1.xlsx" `
+  --database "data/processed/stock_daily.sqlite"
 ```
 
-它会顺序运行原 V2H4、缩放交易门槛候选版和 10 bps 滑点压力测试，最后生成：
+不添加 `--apply` 时不会修改数据库。正常输出应列出已识别字段、源文件日期范围、锚点日期和可导入行数。
 
-```text
-outputs/validation_full/v2h4_comparison.xlsx
-```
+常见错误：
 
-在完整对比结果出来前，每周默认仍使用 `config/v2h4_strategy.json`，不要直接把候选版设为实盘默认。
+- 缺少 `Symbol`：下载时没有选择证券代码。
+- 缺少 `ChangeRatio`：无法连续计算收益率和合成复权价格。
+- 数据库日期没有变化：文件被识别为未改变并跳过，或文件不含新交易日。
+- `missing required columns`：误把旧历史格式、财报或其他 Excel 放入了周行情目录。
 
-## 九、检查数据库到底截止哪一天
-
-检查一个数据库：
-
-```powershell
-python database_status.py --database "<数据库文件路径>"
-```
-
-检查 `data/processed` 中所有 SQLite 数据库：
-
-```powershell
-Get-ChildItem data/processed -Filter *.sqlite | ForEach-Object {
-  python database_status.py --database $_.FullName
-}
-```
+成交后，以券商实际结果更新 `data/input/positions.csv`，下周继续相同步骤。

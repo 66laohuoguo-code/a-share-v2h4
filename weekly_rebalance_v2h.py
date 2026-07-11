@@ -23,7 +23,9 @@ from ashare_utils import (
     buy_order_size_rules,
     load_positions,
     mandatory_trade_cost,
+    round_portfolio_target_shares,
     round_target_shares_for_code,
+    trade_value_floor,
     trading_cost_snapshot,
     write_excel_workbook,
 )
@@ -124,10 +126,19 @@ def build_order_plan(
     warnings = []
     last_known_close = last_known_close or {}
     slippage = max(0.0, float(strategy_args.slippage_bps)) / 10000.0
-    min_trade_threshold = max(
-        float(strategy_args.min_trade_value),
-        float(total_value) * max(0.0, float(getattr(strategy_args, "min_trade_weight", 0.0))),
-    )
+    rejected_by_floor = []
+    target_prices = {}
+    for code, target_weight in targets.items():
+        row = prices.get(code)
+        if row is None:
+            continue
+        close = safe_float(row.get("close"), np.nan)
+        if not math.isfinite(close) or close <= 0:
+            continue
+        current_shares = int(holdings.get(code, 0))
+        side = "BUY" if float(target_weight) * total_value > current_shares * close else "SELL"
+        target_prices[code] = close * (1.0 + slippage if side == "BUY" else 1.0 - slippage)
+    target_shares_by_code = round_portfolio_target_shares(targets, total_value, target_prices)
 
     for code in sorted(set(holdings).union(targets)):
         row = prices.get(code)
@@ -142,15 +153,20 @@ def build_order_plan(
         target_weight = max(0.0, float(targets.get(code, 0.0)))
         indicative_side = "BUY" if target_weight * total_value > current_shares * close else "SELL"
         indicative_price = close * (1.0 + slippage if indicative_side == "BUY" else 1.0 - slippage)
-        target_shares = (
-            round_target_shares_for_code(target_weight * total_value, indicative_price, code)
-            if target_weight > 0
-            else 0
-        )
+        target_shares = int(target_shares_by_code.get(code, 0)) if target_weight > 0 else 0
         difference = int(target_shares - current_shares)
         if difference == 0:
             continue
         side = "BUY" if difference > 0 else "SELL"
+        order_floor, transition_type = trade_value_floor(
+            total_value,
+            current_shares,
+            target_shares,
+            strategy_args.min_trade_value,
+            getattr(strategy_args, "min_trade_weight", 0.0),
+            getattr(strategy_args, "entry_exit_min_trade_value", None),
+            getattr(strategy_args, "entry_exit_min_trade_weight", 0.0),
+        )
         trade_shares = limited_trade_shares(
             code,
             abs(difference),
@@ -170,7 +186,8 @@ def build_order_plan(
         if trade_shares <= 0:
             continue
         gross = trade_shares * price
-        if gross < min_trade_threshold:
+        if gross < order_floor:
+            rejected_by_floor.append((code, side, transition_type, gross, order_floor))
             continue
         feature = feature_by_code.get(code, {})
         planned.append(
@@ -180,6 +197,8 @@ def build_order_plan(
                 "code": code,
                 "name": str(row.get("name", "")),
                 "side": side,
+                "transition_type": transition_type,
+                "trade_value_floor": order_floor,
                 "shares": int(trade_shares),
                 "reference_close": close,
                 "indicative_price": price,
@@ -233,7 +252,7 @@ def build_order_plan(
             warnings.append(f"{code}: projected cash was insufficient, so the buy order was omitted.")
             continue
         gross = shares * float(order["indicative_price"])
-        if gross < min_trade_threshold:
+        if gross < float(order["trade_value_floor"]):
             continue
         fee = mandatory_trade_cost(gross, "BUY", as_of_date, code)
         projected_cash -= gross + fee
@@ -241,6 +260,15 @@ def build_order_plan(
         item = dict(order)
         item.update({"shares": shares, "gross_amount": gross, "estimated_fee": fee, "projected_cash_after": projected_cash})
         executed.append(item)
+
+    if rejected_by_floor:
+        buy_rejections = [item for item in rejected_by_floor if item[1] == "BUY"]
+        sell_rejections = [item for item in rejected_by_floor if item[1] == "SELL"]
+        warnings.append(
+            "Trade-value floors filtered "
+            f"{len(rejected_by_floor)} planned orders "
+            f"({len(buy_rejections)} BUY, {len(sell_rejections)} SELL)."
+        )
 
     orders = pd.DataFrame(executed)
     if orders.empty:
@@ -251,6 +279,8 @@ def build_order_plan(
                 "code",
                 "name",
                 "side",
+                "transition_type",
+                "trade_value_floor",
                 "shares",
                 "reference_close",
                 "indicative_price",
@@ -350,6 +380,7 @@ def run(args):
             current_weights,
             strategy_args,
             float(regime["target_equity_weight"]),
+            total_value,
         )
         orders, projected_positions, projected_cash, order_warnings = build_order_plan(
             holdings,
@@ -394,6 +425,26 @@ def run(args):
             "current_equity_weight": float((total_value - cash) / total_value),
             "selected_count": int(target_meta.get("selected_count", 0)),
             "target_weight_sum": float(target_meta.get("target_weight_sum", 0.0)),
+            "min_trade_value": float(strategy_args.min_trade_value),
+            "min_trade_weight": float(getattr(strategy_args, "min_trade_weight", 0.0)),
+            "entry_exit_min_trade_value": (
+                None
+                if getattr(strategy_args, "entry_exit_min_trade_value", None) is None
+                else float(strategy_args.entry_exit_min_trade_value)
+            ),
+            "entry_exit_min_trade_weight": float(
+                getattr(strategy_args, "entry_exit_min_trade_weight", 0.0)
+            ),
+            "lot_aware_selection": bool(target_meta.get("lot_aware", False)),
+            "affordable_target_count": int(
+                target_meta.get("affordable_count", target_meta.get("selected_count", 0))
+            ),
+            "effective_max_stock_weight": float(
+                target_meta.get("effective_max_stock_weight", strategy_args.max_stock_weight)
+            ),
+            "effective_max_industry_weight": float(
+                target_meta.get("effective_max_industry_weight", strategy_args.max_industry_weight)
+            ),
             "order_count": int(len(orders)),
             "buy_count": int((orders["side"] == "BUY").sum()) if not orders.empty else 0,
             "sell_count": int((orders["side"] == "SELL").sum()) if not orders.empty else 0,

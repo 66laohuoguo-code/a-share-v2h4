@@ -35,7 +35,8 @@ flowchart LR
 ```text
 .
 ├── ashare_utils.py                 # A 股费用、申报数量、持仓与 Excel 工具
-├── clean_resset_data.py            # 日线 Excel 增量导入 SQLite
+├── clean_resset_data.py            # 历史日线 Excel 建库
+├── import_csmar_forward_quotation.py # 周度前推行情增量续接
 ├── validate_clean_data.py          # 数据质量检查
 ├── database_status.py              # 数据库日期范围检查
 ├── factor_rank_backtest.py         # 基础特征、市场状态与公司行动
@@ -44,7 +45,7 @@ flowchart LR
 ├── compare_backtest_results.py     # 多组回测对比表
 ├── run_weekly.ps1                  # 每周导入、检查、调仓
 ├── run_v2h4_validation.ps1         # 基准、候选、压力测试
-├── config/                         # 两套可复现策略配置
+├── config/                         # 正式、legacy 与压力候选配置
 ├── data/input/                     # 账户示例文件
 ├── tests/                          # 核心规则单元测试
 └── WEEKLY_FRIDAY_GUIDE.md          # 每周操作说明
@@ -76,7 +77,7 @@ python -m pip install -r requirements.txt
 
 ## 输入数据
 
-清洗器读取 `.xlsx` 文件。文件名建议使用：
+项目区分两类 `.xlsx`：首次建库使用历史行情适配器，数据库建成后的每周更新使用前推行情适配器。文件名建议使用：
 
 ```text
 YYYY_YYYYMMDD_N.xlsx
@@ -95,7 +96,7 @@ YYYY_YYYYMMDD_N.xlsx
 data/raw/market_data/
 ```
 
-当前数据适配器识别以下字段后缀：
+历史行情适配器识别以下字段后缀：
 
 | 内容 | 字段后缀 |
 |---|---|
@@ -106,7 +107,16 @@ data/raw/market_data/
 | 复权信息 | `AdjClpr1`, `AdjClpr2`, `Mcfacpr` |
 | 上市状态、币种、行业 | `Listedstate`, `Qttncurrency`, `Csrciccd1`, `Csrciccd2` |
 
-其中 `Dret` 与 `Daret` 用于公司行动记账，不应省略。使用其他供应商时，需要编写相同 SQLite 表结构的数据适配器。
+其中 `Dret` 与 `Daret` 用于公司行动记账，不应省略。
+
+周度前推行情由 `import_csmar_forward_quotation.py` 读取，至少需要：
+
+```text
+TradingDate, Symbol, OpenPrice, ClosePrice, HighPrice, LowPrice,
+Volume, Amount, StateCode, ChangeRatio, TurnoverRate1
+```
+
+它会用本文件首日之前的数据库最新收盘价续接 `ChangeRatio`，因此可以安全处理每周文件以及与数据库重叠的日期。使用其他供应商时，需要实现相同 SQLite 表结构的数据适配器。
 
 ## 建立数据库
 
@@ -120,7 +130,20 @@ python validate_clean_data.py data/processed/stock_daily.sqlite
 python database_status.py --database data/processed/stock_daily.sqlite
 ```
 
-`--reset` 只用于首次建库或明确重建。后续导入会按 `code + trade_date` 更新记录，并跳过未变化的源文件。
+`--reset` 只用于首次建库或明确重建。历史库建好后，每周导入前推行情：
+
+```powershell
+python import_csmar_forward_quotation.py `
+  --source-dir data/raw/market_data `
+  --database data/processed/stock_daily.sqlite `
+  --years 2026 `
+  --apply
+
+python validate_clean_data.py data/processed/stock_daily.sqlite
+python database_status.py --database data/processed/stock_daily.sqlite
+```
+
+前推导入按 `code + trade_date` 更新记录，并自动跳过已经成功导入且没有变化的源文件。不加 `--apply` 时只检查格式和可导入范围，不修改数据库。
 
 ## 运行回测
 
@@ -131,7 +154,7 @@ python factor_rank_backtest_v2h.py `
   --strategy-config config/v2h4_strategy.json `
   --database data/processed/stock_daily.sqlite `
   --start-date 2021-01-05 `
-  --end-date 2026-07-07 `
+  --end-date 2026-07-10 `
   --output-dir outputs/backtest/v2h4
 ```
 
@@ -179,6 +202,20 @@ python weekly_rebalance_v2h.py `
   --output-dir outputs/weekly_rebalance
 ```
 
+Windows 用户也可以把行情导入、数据库检查和调仓合并运行：
+
+```powershell
+powershell.exe `
+  -NoProfile `
+  -ExecutionPolicy Bypass `
+  -File .\run_weekly.ps1 `
+  -Python .\.venv\Scripts\python.exe `
+  -Database data\processed\stock_daily.sqlite `
+  -SourceDir data\raw\market_data `
+  -Positions data\input\positions.csv `
+  -Year (Get-Date).Year
+```
+
 输出包含：
 
 - `summary`：风险状态、目标仓位、费用和警告；
@@ -212,6 +249,29 @@ V2H4 静态因子权重：
 - 波动率、趋势、市场宽度和组合回撤共同决定股票总仓位。
 
 完整参数见 `config/v2h4_strategy.json`。
+
+### 账户规模与整手自适应执行
+
+正式 `config/v2h4_strategy.json` 已采用按组合总资产缩放且能够实际成交的执行规则：
+
+- 普通持仓调整门槛：组合总资产的 2.0%；
+- 新建仓和完全清仓门槛：组合总资产的 0.35%；
+- 门槛基数是股票市值加现金的组合总资产，不是会随订单变化的可用现金；
+- 主板和创业板买入按 100 股整手，科创板和北交所使用各自申报规则；
+- 排名靠前但最小一手成本超过账户预算时，继续检查后续候选，而不是留下不可执行目标；
+- 小账户会自动减少目标持股数，并相应放宽单股和行业上限；
+- 组合级最大余数取整把剩余预算分配成额外整手，使实际股票仓位接近风险模型目标。
+
+共同区间回测中，整手自适应正式版累计收益 39.62%、年化 6.31%、Sharpe 0.707、最大回撤 7.79%。旧固定门槛版累计收益 40.39%、年化 6.41%、Sharpe 0.730、最大回撤 8.43%。正式版接受了很小的历史收益差异，换取跨账户规模可执行性和更低的完整区间回撤。
+
+旧固定门槛配置保留在 `config/v2h4_fixed_floor_legacy.json`，只用于复现对照。运行正式版、legacy 和正式版 10 bps 压力测试：
+
+```powershell
+.\run_v2h4_validation.ps1 `
+  -Database data/processed/stock_daily.sqlite `
+  -StartDate 2021-01-05 `
+  -IncludeStress
+```
 
 ## 回测严谨性
 

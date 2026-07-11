@@ -259,7 +259,7 @@ def latest_event_regime_signal(event_regime_signals, decision_date):
 
 
 def build_market_state(prices, args):
-    frame = prices.copy()
+    frame = prices[["code", "trade_date", "close", "daily_return"]].copy()
     frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
     frame["daily_return"] = pd.to_numeric(frame["daily_return"], errors="coerce").clip(-0.12, 0.12)
     frame = frame.sort_values(["code", "trade_date"])

@@ -62,7 +62,6 @@ factor_rank_backtest_v2e.py
 fetch_event_feeds.py
 financial_reports.py
 historical_deepseek_weekly_signals.py
-import_csmar_forward_quotation.py
 inspect_resset_xlsx.py
 inspect_resset_xlsx_fast.py
 portfolio_rebalance.py
@@ -72,3 +71,4 @@ run_v2_experiments.ps1
 config/*
 !config/v2h4_strategy.json
 !config/v2h4_scaled_trades_candidate.json
+!config/v2h4_fixed_floor_legacy.json

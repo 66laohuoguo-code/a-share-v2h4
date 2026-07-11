@@ -28,8 +28,10 @@ import factor_rank_backtest as base
 from ashare_utils import (
     buy_order_size_rules,
     mandatory_trade_cost,
+    round_portfolio_target_shares,
     round_target_shares_for_code,
     should_rebalance_on_date,
+    trade_value_floor,
     trading_cost_snapshot,
     write_excel_workbook,
 )
@@ -387,6 +389,104 @@ def select_codes(features: pd.DataFrame, holdings: Mapping[str, int], args, targ
     return selected
 
 
+def select_lot_aware_codes(
+    features: pd.DataFrame,
+    holdings: Mapping[str, int],
+    args,
+    target_equity_weight: float,
+    portfolio_value: float,
+) -> Tuple[List[str], pd.Series, Dict[str, object]]:
+    ranked = features.copy().reset_index(drop=True)
+    ranked["code"] = ranked["code"].astype(str).str.zfill(6)
+    ranked["rank"] = np.arange(1, len(ranked) + 1)
+    rank_by_code = ranked.set_index("code")["rank"].to_dict()
+    row_by_code = ranked.set_index("code").to_dict("index")
+    equity_budget = max(0.0, float(portfolio_value) * float(target_equity_weight))
+    target_count = min(max(1, int(args.target_count)), len(ranked))
+    min_holdings = min(target_count, max(1, int(getattr(args, "lot_aware_min_holdings", 5))))
+    max_lot_budget = equity_budget / min_holdings if min_holdings > 0 else equity_budget
+    slippage = max(0.0, float(args.slippage_bps)) / 10000.0
+
+    kept = [
+        code
+        for code, shares in holdings.items()
+        if int(shares) > 0 and rank_by_code.get(str(code), math.inf) <= int(args.sell_rank)
+    ]
+    candidate_order: List[str] = []
+    for code in sorted(kept, key=lambda item: rank_by_code.get(str(item), math.inf)):
+        code = str(code).zfill(6)
+        if code not in candidate_order:
+            candidate_order.append(code)
+    for code in ranked.loc[ranked["rank"] <= int(args.buy_rank), "code"]:
+        if code not in candidate_order:
+            candidate_order.append(code)
+    for code in ranked["code"]:
+        if code not in candidate_order:
+            candidate_order.append(code)
+
+    lot_values: Dict[str, float] = {}
+    industries: Dict[str, str] = {}
+    eligible_order: List[str] = []
+    skipped_lot_too_expensive = 0
+    for code in candidate_order:
+        row = row_by_code.get(code, {})
+        close = safe_float(row.get("close"), np.nan)
+        if not math.isfinite(close) or close <= 0:
+            continue
+        minimum, _ = buy_order_size_rules(code)
+        lot_value = float(minimum) * close * (1.0 + slippage)
+        if lot_value > max_lot_budget + 1e-8:
+            skipped_lot_too_expensive += 1
+            continue
+        lot_values[code] = lot_value
+        industries[code] = str(row.get("industry_1") or "UNKNOWN")
+        eligible_order.append(code)
+
+    provisional: List[str] = []
+    reserved = 0.0
+    for code in eligible_order:
+        lot_value = lot_values[code]
+        if reserved + lot_value > equity_budget + 1e-8:
+            continue
+        provisional.append(code)
+        reserved += lot_value
+        if len(provisional) >= target_count:
+            break
+
+    desired_count = len(provisional)
+    max_industry_count = max(
+        1,
+        int(math.floor(desired_count * float(args.max_industry_weight) + 1e-9)),
+    )
+    selected: List[str] = []
+    industry_counts: Dict[str, int] = {}
+    reserved = 0.0
+    for code in eligible_order:
+        industry = industries[code]
+        lot_value = lot_values[code]
+        if industry_counts.get(industry, 0) >= max_industry_count:
+            continue
+        if reserved + lot_value > equity_budget + 1e-8:
+            continue
+        selected.append(code)
+        industry_counts[industry] = industry_counts.get(industry, 0) + 1
+        reserved += lot_value
+        if len(selected) >= desired_count:
+            break
+
+    minimum_weights = pd.Series(
+        {code: lot_values[code] / float(portfolio_value) for code in selected},
+        dtype=float,
+    )
+    return selected, minimum_weights, {
+        "lot_aware": True,
+        "affordable_count": int(len(selected)),
+        "minimum_lot_budget": float(reserved),
+        "max_single_lot_budget": float(max_lot_budget),
+        "skipped_lot_too_expensive": int(skipped_lot_too_expensive),
+    }
+
+
 def cap_and_redistribute(
     raw: pd.Series,
     industries: pd.Series,
@@ -440,16 +540,73 @@ def cap_and_redistribute(
     return weights.clip(lower=0.0)
 
 
+def cap_and_redistribute_with_minimums(
+    raw: pd.Series,
+    industries: pd.Series,
+    minimum_weights: pd.Series,
+    target_equity_weight: float,
+    max_stock_weight: float,
+    max_industry_weight: float,
+) -> pd.Series:
+    index = raw.index
+    raw = safe_series(raw, index).fillna(0.0).clip(lower=0.0)
+    if raw.sum() <= 0:
+        raw = pd.Series(1.0, index=index)
+    industries = industries.reindex(index).fillna("UNKNOWN").astype(str)
+    weights = safe_series(minimum_weights, index).fillna(0.0).clip(lower=0.0)
+    if float(weights.sum()) > target_equity_weight + 1e-10:
+        return weights
+
+    for _ in range(100):
+        deficit = target_equity_weight - float(weights.sum())
+        if deficit <= 1e-8:
+            break
+        industry_total = weights.groupby(industries).sum()
+        stock_capacity = (max_stock_weight - weights).clip(lower=0.0)
+        industry_capacity = industries.map(max_industry_weight - industry_total).clip(lower=0.0)
+        eligible = (stock_capacity > 1e-10) & (industry_capacity > 1e-10)
+        if not eligible.any():
+            break
+        extra = raw.where(eligible, 0.0)
+        if extra.sum() <= 0:
+            extra = stock_capacity.where(eligible, 0.0)
+        extra = extra / extra.sum() * deficit
+        extra = np.minimum(extra, stock_capacity)
+        for industry, members in industries.groupby(industries).groups.items():
+            member_index = list(members)
+            allowed = max(0.0, max_industry_weight - float(weights.loc[member_index].sum()))
+            amount = float(extra.loc[member_index].sum())
+            if amount > allowed + 1e-12 and amount > 0:
+                extra.loc[member_index] *= allowed / amount
+        added = float(extra.sum())
+        weights += extra
+        if added < 1e-10:
+            break
+    return weights.clip(lower=0.0)
+
+
 def build_targets_v2(
     features: pd.DataFrame,
     holdings: Mapping[str, int],
     current_weights: Mapping[str, float],
     args,
     target_equity_weight: float,
+    portfolio_value: Optional[float] = None,
 ) -> Tuple[Dict[str, float], Dict[str, object]]:
     if features.empty or target_equity_weight <= 0:
         return {}, {"selected_count": 0, "target_weight_sum": 0.0}
-    selected = select_codes(features, holdings, args, target_equity_weight)
+    lot_meta: Dict[str, object] = {"lot_aware": False}
+    minimum_weights = pd.Series(dtype=float)
+    if bool(getattr(args, "enable_lot_aware_selection", False)) and portfolio_value and portfolio_value > 0:
+        selected, minimum_weights, lot_meta = select_lot_aware_codes(
+            features,
+            holdings,
+            args,
+            target_equity_weight,
+            float(portfolio_value),
+        )
+    else:
+        selected = select_codes(features, holdings, args, target_equity_weight)
     if not selected:
         return {}, {"selected_count": 0, "target_weight_sum": 0.0}
 
@@ -462,13 +619,44 @@ def build_targets_v2(
     fallback_vol = fallback_vol if pd.notna(fallback_vol) and fallback_vol > 0 else 0.30
     risk_scale = volatility.fillna(fallback_vol).clip(lower=float(args.min_stock_volatility))
     raw = score_weight / (risk_scale ** float(args.inverse_vol_power))
-    desired = cap_and_redistribute(
-        raw,
-        frame["industry_1"],
-        target_equity_weight,
-        float(args.max_stock_weight),
-        float(args.max_industry_weight),
-    )
+    effective_max_stock_weight = float(args.max_stock_weight)
+    effective_max_industry_weight = float(args.max_industry_weight)
+    if bool(lot_meta.get("lot_aware")):
+        count = max(1, len(selected))
+        max_minimum = float(minimum_weights.max()) if not minimum_weights.empty else 0.0
+        effective_max_stock_weight = min(
+            float(getattr(args, "lot_aware_max_stock_weight", 0.25)),
+            max(
+                effective_max_stock_weight,
+                target_equity_weight / count * float(getattr(args, "lot_aware_stock_cap_multiplier", 1.25)),
+                max_minimum,
+            ),
+        )
+        minimum_by_industry = minimum_weights.groupby(frame["industry_1"].fillna("UNKNOWN").astype(str)).sum()
+        effective_max_industry_weight = min(
+            float(getattr(args, "lot_aware_max_industry_weight", 0.50)),
+            max(
+                effective_max_industry_weight,
+                effective_max_stock_weight * 2.0,
+                float(minimum_by_industry.max()) if not minimum_by_industry.empty else 0.0,
+            ),
+        )
+        desired = cap_and_redistribute_with_minimums(
+            raw,
+            frame["industry_1"],
+            minimum_weights,
+            target_equity_weight,
+            effective_max_stock_weight,
+            effective_max_industry_weight,
+        )
+    else:
+        desired = cap_and_redistribute(
+            raw,
+            frame["industry_1"],
+            target_equity_weight,
+            effective_max_stock_weight,
+            effective_max_industry_weight,
+        )
 
     # Avoid spending money on trivial changes; keep target allocations otherwise.
     target = desired.to_dict()
@@ -485,6 +673,9 @@ def build_targets_v2(
         "selected_count": int(len(selected)),
         "target_weight_sum": float(sum(target.values())),
         "desired_equity_weight": float(target_equity_weight),
+        "effective_max_stock_weight": float(effective_max_stock_weight),
+        "effective_max_industry_weight": float(effective_max_industry_weight),
+        **lot_meta,
     }
 
 
@@ -505,11 +696,22 @@ def execute_trades_v2(
     args,
 ) -> Tuple[float, List[Dict[str, object]]]:
     planned: List[Dict[str, object]] = []
-    min_trade_threshold = max(
-        float(args.min_trade_value),
-        float(portfolio_open_value) * max(0.0, float(getattr(args, "min_trade_weight", 0.0))),
+    target_prices: Dict[str, float] = {}
+    for code, target_weight in targets.items():
+        row = prices.get(code)
+        if row is None:
+            continue
+        raw_open = safe_float(row.get("open"), np.nan)
+        if not math.isfinite(raw_open) or raw_open <= 0:
+            continue
+        current_shares = int(holdings.get(code, 0))
+        side = "BUY" if float(target_weight) * portfolio_open_value > current_shares * raw_open else "SELL"
+        target_prices[code] = execution_price(raw_open, side, float(args.slippage_bps))
+    target_shares_by_code = round_portfolio_target_shares(
+        targets,
+        portfolio_open_value,
+        target_prices,
     )
-
     for code in sorted(set(holdings).union(targets)):
         row = prices.get(code)
         if row is None:
@@ -523,14 +725,22 @@ def execute_trades_v2(
         if base.blocked_by_price_limit(code, row, side, args):
             continue
         price = execution_price(raw_open, side, float(args.slippage_bps))
-        target_value = target_weight * portfolio_open_value
-        target_shares = round_target_shares_for_code(target_value, price, code) if target_weight > 0 else 0
+        target_shares = int(target_shares_by_code.get(code, 0)) if target_weight > 0 else 0
         trade_shares = int(target_shares - current_shares)
         if trade_shares == 0:
             continue
         side = "BUY" if trade_shares > 0 else "SELL"
+        order_floor, transition_type = trade_value_floor(
+            portfolio_open_value,
+            current_shares,
+            target_shares,
+            args.min_trade_value,
+            getattr(args, "min_trade_weight", 0.0),
+            getattr(args, "entry_exit_min_trade_value", None),
+            getattr(args, "entry_exit_min_trade_weight", 0.0),
+        )
         gross = abs(trade_shares) * price
-        if gross < min_trade_threshold:
+        if gross < order_floor:
             continue
         # Do not pretend a backtest can trade a large fraction of a stock's daily volume.
         avg_amount = safe_float(liquidity_by_code.get(code), np.nan)
@@ -543,6 +753,8 @@ def execute_trades_v2(
             max_shares = int(minimum + math.floor((raw_max_shares - minimum) / increment) * increment)
             trade_shares = int(math.copysign(min(abs(trade_shares), max_shares), trade_shares))
             gross = abs(trade_shares) * price
+            if gross < order_floor:
+                continue
         planned.append(
             {
                 "trade_date": trade_date,
@@ -550,6 +762,8 @@ def execute_trades_v2(
                 "code": code,
                 "name": str(row.get("name", "")),
                 "side": side,
+                "transition_type": transition_type,
+                "trade_value_floor": order_floor,
                 "shares": abs(int(trade_shares)),
                 "open_price": raw_open,
                 "price": price,
@@ -573,7 +787,7 @@ def execute_trades_v2(
         if shares <= 0:
             continue
         gross = shares * float(order["price"])
-        if gross < min_trade_threshold:
+        if gross < float(order["trade_value_floor"]):
             continue
         fee = mandatory_trade_cost(gross, "SELL", trade_date, code)
         holdings[code] = int(holdings.get(code, 0)) - shares
@@ -600,7 +814,7 @@ def execute_trades_v2(
         if shares < minimum:
             continue
         gross = shares * float(order["price"])
-        if gross < min_trade_threshold:
+        if gross < float(order["trade_value_floor"]):
             continue
         fee = mandatory_trade_cost(gross, "BUY", trade_date, code)
         cash -= gross + fee
@@ -617,6 +831,7 @@ def make_summary(equity: pd.DataFrame, trades: pd.DataFrame, initial_cash: float
     drawdown = equity["total_value"] / equity["total_value"].cummax() - 1.0
     return {
         "strategy": "factor_rank_v2_continuous_risk",
+        "strategy_name": str(getattr(args, "strategy_name", "V2H")),
         "start_date": str(equity["trade_date"].iloc[0]),
         "end_date": str(equity["trade_date"].iloc[-1]),
         "initial_cash": float(initial_cash),
@@ -654,6 +869,16 @@ def make_summary(equity: pd.DataFrame, trades: pd.DataFrame, initial_cash: float
         "rebalance_band_weight": float(args.rebalance_band_weight),
         "min_trade_value": float(args.min_trade_value),
         "min_trade_weight": float(getattr(args, "min_trade_weight", 0.0)),
+        "entry_exit_min_trade_value": (
+            None
+            if getattr(args, "entry_exit_min_trade_value", None) is None
+            else float(args.entry_exit_min_trade_value)
+        ),
+        "entry_exit_min_trade_weight": float(getattr(args, "entry_exit_min_trade_weight", 0.0)),
+        "enable_lot_aware_selection": bool(getattr(args, "enable_lot_aware_selection", False)),
+        "lot_aware_min_holdings": int(getattr(args, "lot_aware_min_holdings", 5)),
+        "lot_aware_max_stock_weight": float(getattr(args, "lot_aware_max_stock_weight", 0.25)),
+        "lot_aware_max_industry_weight": float(getattr(args, "lot_aware_max_industry_weight", 0.50)),
         "cost_model": "date-aware statutory A-share costs + configurable one-sided slippage + participation cap",
         "corporate_action_model": "RESSET total-return/capital-return inferred cash distributions and share factors",
     }
@@ -771,6 +996,7 @@ def run_backtest(args):
                     current_weights,
                     args,
                     float(regime["target_equity_weight"]),
+                    previous_total,
                 )
                 liquidity_by_code = features.set_index("code")["avg_amount_60"].to_dict() if not features.empty else {}
                 cash, executed = execute_trades_v2(
@@ -914,6 +1140,13 @@ def parse_args(argv=None):
     parser.add_argument("--rebalance-band-weight", type=float, default=0.0025)
     parser.add_argument("--min-trade-value", type=float, default=20_000.0)
     parser.add_argument("--min-trade-weight", type=float, default=0.0)
+    parser.add_argument("--entry-exit-min-trade-value", type=float)
+    parser.add_argument("--entry-exit-min-trade-weight", type=float, default=0.0)
+    parser.add_argument("--enable-lot-aware-selection", action="store_true")
+    parser.add_argument("--lot-aware-min-holdings", type=int, default=5)
+    parser.add_argument("--lot-aware-stock-cap-multiplier", type=float, default=1.25)
+    parser.add_argument("--lot-aware-max-stock-weight", type=float, default=0.25)
+    parser.add_argument("--lot-aware-max-industry-weight", type=float, default=0.50)
 
     # Data / base features inherited from V1.
     parser.add_argument("--min-history-days", type=int, default=252)

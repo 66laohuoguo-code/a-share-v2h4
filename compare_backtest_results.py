@@ -15,6 +15,7 @@ from ashare_utils import write_excel_workbook
 
 SUMMARY_KEYS = [
     "strategy",
+    "strategy_name",
     "start_date",
     "end_date",
     "initial_cash",
@@ -35,6 +36,12 @@ SUMMARY_KEYS = [
     "average_actual_equity_weight",
     "min_trade_value",
     "min_trade_weight",
+    "entry_exit_min_trade_value",
+    "entry_exit_min_trade_weight",
+    "enable_lot_aware_selection",
+    "lot_aware_min_holdings",
+    "lot_aware_max_stock_weight",
+    "lot_aware_max_industry_weight",
     "slippage_bps",
 ]
 

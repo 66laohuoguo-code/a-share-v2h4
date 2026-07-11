@@ -149,6 +149,68 @@ def round_target_shares_for_code(target_value, price, code):
     return int(minimum + math.floor((raw - minimum) / increment) * increment)
 
 
+def round_portfolio_target_shares(target_weights, portfolio_value, prices):
+    """Round a target portfolio by lots while keeping total equity close to target."""
+    portfolio_value = max(0.0, float(portfolio_value))
+    shares_by_code = {}
+    candidates = []
+    rounded_value = 0.0
+    target_value = 0.0
+
+    for code, weight in target_weights.items():
+        code = str(code).zfill(6)
+        price = prices.get(code)
+        if price is None or pd.isna(price) or float(price) <= 0:
+            continue
+        price = float(price)
+        desired_value = max(0.0, float(weight)) * portfolio_value
+        shares = round_target_shares_for_code(desired_value, price, code)
+        shares_by_code[code] = shares
+        rounded_value += shares * price
+        target_value += desired_value
+        minimum, increment = buy_order_size_rules(code)
+        extra_shares = minimum if shares == 0 else increment
+        lot_value = extra_shares * price
+        remainder = desired_value - shares * price
+        candidates.append((remainder / lot_value if lot_value > 0 else 0.0, code, extra_shares, lot_value))
+
+    residual = max(0.0, target_value - rounded_value)
+    for _, code, extra_shares, lot_value in sorted(candidates, reverse=True):
+        if abs(residual - lot_value) + 1e-8 >= abs(residual):
+            continue
+        shares_by_code[code] = int(shares_by_code.get(code, 0)) + int(extra_shares)
+        residual -= lot_value
+    return shares_by_code
+
+
+def trade_value_floor(
+    portfolio_value,
+    current_shares,
+    target_shares,
+    min_trade_value,
+    min_trade_weight=0.0,
+    entry_exit_min_trade_value=None,
+    entry_exit_min_trade_weight=0.0,
+):
+    """Return the applicable order-value floor and transition type."""
+    current_shares = max(0, int(current_shares))
+    target_shares = max(0, int(target_shares))
+    if current_shares == 0 and target_shares > 0:
+        transition = "ENTRY"
+    elif current_shares > 0 and target_shares == 0:
+        transition = "EXIT"
+    else:
+        transition = "ADJUST"
+
+    if transition in {"ENTRY", "EXIT"} and entry_exit_min_trade_value is not None:
+        fixed_floor = max(0.0, float(entry_exit_min_trade_value))
+        weight_floor = max(0.0, float(entry_exit_min_trade_weight))
+    else:
+        fixed_floor = max(0.0, float(min_trade_value))
+        weight_floor = max(0.0, float(min_trade_weight))
+    return max(fixed_floor, max(0.0, float(portfolio_value)) * weight_floor), transition
+
+
 def _schedule_rate(schedule, trade_date):
     date = str(trade_date or datetime.now().date().isoformat())[:10]
     for row in schedule:

@@ -27,23 +27,23 @@ if ($PlanOnly) {
     --database $Database `
     --start-date $StartDate `
     --end-date $EndDate `
-    --output-dir outputs/validation_full/v2h4_corrected
+    --output-dir outputs/validation_full/v2h4_lot_aware_official
 
 & $Python factor_rank_backtest_v2h.py `
-    --strategy-config config/v2h4_scaled_trades_candidate.json `
+    --strategy-config config/v2h4_fixed_floor_legacy.json `
     --database $Database `
     --start-date $StartDate `
     --end-date $EndDate `
-    --output-dir outputs/validation_full/v2h4_scaled_trades
+    --output-dir outputs/validation_full/v2h4_fixed_floor_legacy
 
 if ($IncludeStress) {
     & $Python factor_rank_backtest_v2h.py `
-        --strategy-config config/v2h4_scaled_trades_candidate.json `
+        --strategy-config config/v2h4_strategy.json `
         --database $Database `
         --start-date $StartDate `
         --end-date $EndDate `
         --slippage-bps 10 `
-        --output-dir outputs/validation_full/v2h4_scaled_trades_slippage10
+        --output-dir outputs/validation_full/v2h4_lot_aware_official_slippage10
 }
 
 & $Python compare_backtest_results.py `

@@ -2,7 +2,7 @@
 
 Everything below `data/` is local and ignored by Git, except the two example account files.
 
-- `raw/market_data/`: local market-data `.xlsx` exports. Recommended name: `YYYY_YYYYMMDD_N.xlsx`.
+- `raw/market_data/`: local weekly forward-quotation `.xlsx` exports. Recommended name: `YYYY_YYYYMMDD_N.xlsx`. Required columns are `TradingDate`, `Symbol`, OHLC, `Volume`, `Amount`, `StateCode`, `ChangeRatio`, and `TurnoverRate1`.
 - `processed/`: SQLite databases and generated factor/event tables.
 - `input/positions.csv`: real holdings and cash. Never commit it.
 - `input/account_state.json`: local portfolio peak used by the drawdown guard.
