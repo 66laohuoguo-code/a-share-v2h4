@@ -12,6 +12,8 @@ Design choices
 - CSMAR prices are re-scaled per stock and chained with ChangeRatio. This
   avoids artificial price jumps at both the provider boundary and week-to-week
   updates.
+- Unadjusted execution prices are reconstructed independently as market value
+  divided by shares. They never inherit the source workbook's adjustment scale.
 - StateCode == 2 rows are market holidays in this export and are skipped.
 - Only codes with an earlier database close are appended. Newly listed codes
   cannot yet meet the strategy's history requirement and lack historical
@@ -23,6 +25,7 @@ Design choices
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sqlite3
 import sys
@@ -47,6 +50,22 @@ REQUIRED_HEADERS = {
     "ChangeRatio",
     "TurnoverRate1",
 }
+RAW_PRICE_COLUMNS = (
+    "raw_prev_close",
+    "raw_open",
+    "raw_high",
+    "raw_low",
+    "raw_close",
+)
+EXECUTION_PRICE_PAIRS = (
+    ("MarketValue", "TotalShare"),
+    ("CirculatedMarketValue", "CirculatedShare"),
+)
+CLASS_EXECUTION_PRICE_PAIRS = {
+    "A": ("AValue", "ACirculatedShare"),
+    "B": ("BValue", "BCirculatedShare"),
+}
+EXECUTION_PRICE_MAX_PAIR_SPREAD = 0.005
 
 
 def local_name(tag: str) -> str:
@@ -207,13 +226,63 @@ def header_map(header):
             "This does not look like the expected CSMAR TRD_FwardQuotation export. "
             f"Missing headers: {', '.join(missing)}"
         )
+    all_execution_pairs = (*EXECUTION_PRICE_PAIRS, *CLASS_EXECUTION_PRICE_PAIRS.values())
+    if not any(
+        value_header in mapping and share_header in mapping
+        for value_header, share_header in all_execution_pairs
+    ):
+        raise ValueError(
+            "The forward-adjusted ClosePrice cannot be used for real orders. Include either "
+            "AValue + ACirculatedShare (preferred for A shares), or market-value and share "
+            "fields so the unadjusted market close can be reconstructed."
+        )
     return mapping
 
 
+def value_per_share_from_row(raw, columns, pair):
+    value_header, share_header = pair
+    if value_header not in columns or share_header not in columns:
+        return None
+    value_idx = columns[value_header]
+    share_idx = columns[share_header]
+    market_value = parse_float(raw[value_idx] if value_idx < len(raw) else None)
+    shares = parse_float(raw[share_idx] if share_idx < len(raw) else None)
+    if market_value is None or shares is None or market_value <= 0 or shares <= 0:
+        return None
+    candidate = market_value / shares
+    return candidate if math.isfinite(candidate) and candidate > 0 else None
+
+
+def unadjusted_close_from_row(raw, columns, code=None):
+    security_class = "B" if code and code.startswith(("200", "900")) else "A"
+    class_candidate = value_per_share_from_row(
+        raw, columns, CLASS_EXECUTION_PRICE_PAIRS[security_class]
+    )
+    if class_candidate is not None:
+        return round(class_candidate, 2)
+
+    candidates = []
+    for pair in EXECUTION_PRICE_PAIRS:
+        candidate = value_per_share_from_row(raw, columns, pair)
+        if candidate is not None:
+            candidates.append(candidate)
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        low = min(candidates)
+        high = max(candidates)
+        if (high - low) / high > EXECUTION_PRICE_MAX_PAIR_SPREAD:
+            return None
+    return round(sum(candidates) / len(candidates), 2)
+
+
 def latest_database_meta_before(conn, source_start_date):
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(stock_daily)")}
+    raw_close_sql = "d.raw_close" if "raw_close" in columns else "NULL"
     rows = conn.execute(
-        """
-        SELECT d.code, d.name, d.close, d.listed_state, d.currency,
+        f"""
+        SELECT d.code, d.name, d.close, {raw_close_sql} AS raw_close,
+               d.listed_state, d.currency,
                d.industry_1, d.industry_2, d.trade_date
         FROM stock_daily d
         JOIN (
@@ -229,13 +298,17 @@ def latest_database_meta_before(conn, source_start_date):
     ).fetchall()
 
     meta = {}
-    for code, name, close, listed_state, currency, industry_1, industry_2, trade_date in rows:
+    for code, name, close, raw_close, listed_state, currency, industry_1, industry_2, trade_date in rows:
         close_value = parse_float(close)
         if close_value is None or close_value <= 0:
             continue
+        raw_close_value = parse_float(raw_close)
+        if raw_close_value is None or raw_close_value <= 0:
+            raw_close_value = close_value
         meta[str(code).zfill(6)] = {
             "name": name,
             "last_close": close_value,
+            "last_raw_close": raw_close_value,
             "listed_state": listed_state or "Norm",
             "currency": currency or "CNY",
             "industry_1": industry_1,
@@ -249,7 +322,7 @@ def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def ensure_tables_exist(conn):
+def ensure_tables_exist(conn, apply=False):
     found = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='stock_daily'"
     ).fetchone()
@@ -258,6 +331,9 @@ def ensure_tables_exist(conn):
             "The target database has no stock_daily table. "
             "Use a copy of your existing RESSET database, not a blank file."
         )
+
+    if not apply:
+        return
 
     conn.execute(
         """
@@ -269,6 +345,17 @@ def ensure_tables_exist(conn):
         )
         """
     )
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(stock_daily)")}
+    added_columns = []
+    for column in RAW_PRICE_COLUMNS:
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE stock_daily ADD COLUMN {column} REAL")
+            added_columns.append(column)
+    if added_columns:
+        # Existing forward files must be read once more to populate the new raw prices.
+        conn.execute("DELETE FROM source_file_state")
+        print(f"Database migration added raw price columns: {', '.join(added_columns)}")
+        print("Existing forward files will be re-imported once to populate real market prices.")
     conn.commit()
 
 
@@ -352,6 +439,7 @@ def insert_records(conn, records, imported_at):
     sql = """
         INSERT INTO stock_daily (
             code, name, trade_date, prev_close, open, high, low, close,
+            raw_prev_close, raw_open, raw_high, raw_low, raw_close,
             adj_close_1, adj_close_2, volume, amount, turnover_total,
             turnover_float, adj_factor, daily_return, capital_return,
             risk_free_return, listed_state, currency, industry_1, industry_2,
@@ -359,6 +447,7 @@ def insert_records(conn, records, imported_at):
         )
         VALUES (
             :code, :name, :trade_date, :prev_close, :open, :high, :low, :close,
+            :raw_prev_close, :raw_open, :raw_high, :raw_low, :raw_close,
             :adj_close_1, :adj_close_2, :volume, :amount, :turnover_total,
             :turnover_float, :adj_factor, :daily_return, :capital_return,
             :risk_free_return, :listed_state, :currency, :industry_1, :industry_2,
@@ -371,6 +460,11 @@ def insert_records(conn, records, imported_at):
             high=excluded.high,
             low=excluded.low,
             close=excluded.close,
+            raw_prev_close=excluded.raw_prev_close,
+            raw_open=excluded.raw_open,
+            raw_high=excluded.raw_high,
+            raw_low=excluded.raw_low,
+            raw_close=excluded.raw_close,
             adj_close_1=excluded.adj_close_1,
             adj_close_2=excluded.adj_close_2,
             volume=excluded.volume,
@@ -487,6 +581,10 @@ def process_file(conn, path, args):
             code: item["last_close"]
             for code, item in existing.items()
         }
+        last_raw_close = {
+            code: item["last_raw_close"]
+            for code, item in existing.items()
+        }
         last_source_date = {}
 
         rows = iter_sheet_rows(zf, sheet_path, shared)
@@ -545,13 +643,29 @@ def process_file(conn, path, args):
                 continue
 
             prior_close = last_close[code]
+            prior_raw_close = last_raw_close[code]
             synthetic_close = prior_close * (1.0 + change_ratio)
             scale = synthetic_close / close_forward
+            expected_raw_close = prior_raw_close * (1.0 + change_ratio)
+            market_close = unadjusted_close_from_row(raw, columns, code=code)
+            if market_close is None and math.isfinite(expected_raw_close) and expected_raw_close > 0:
+                market_close = round(expected_raw_close, 2)
+                counters["execution_price_return_chain_fallback"] += 1
+            if market_close is None or market_close <= 0:
+                counters["missing_or_invalid_execution_price"] += 1
+                continue
+            execution_scale = market_close / close_forward
 
             def scaled_price(header_name):
                 idx = columns[header_name]
                 value = parse_float(raw[idx] if idx < len(raw) else None)
                 return value * scale if value is not None and value > 0 else synthetic_close
+
+            def raw_price(header_name):
+                idx = columns[header_name]
+                value = parse_float(raw[idx] if idx < len(raw) else None)
+                result = value * execution_scale if value is not None and value > 0 else market_close
+                return round(result, 2)
 
             turnover_idx = columns["TurnoverRate1"]
             volume_idx = columns["Volume"]
@@ -570,6 +684,11 @@ def process_file(conn, path, args):
                 "high": scaled_price("HighPrice"),
                 "low": scaled_price("LowPrice"),
                 "close": synthetic_close,
+                "raw_prev_close": prior_raw_close,
+                "raw_open": raw_price("OpenPrice"),
+                "raw_high": raw_price("HighPrice"),
+                "raw_low": raw_price("LowPrice"),
+                "raw_close": market_close,
                 "adj_close_1": synthetic_close,
                 "adj_close_2": synthetic_close,
                 "volume": volume,
@@ -600,6 +719,7 @@ def process_file(conn, path, args):
                     counters["overlap_return_mismatch"] += 1
 
             last_close[code] = synthetic_close
+            last_raw_close[code] = market_close
             seen_dates.add(trade_date)
             counters["eligible_rows"] += 1
             records.append(record)
@@ -624,6 +744,8 @@ def process_file(conn, path, args):
             "unknown_or_new_code_skipped",
             "bad_code",
             "missing_or_invalid_price",
+            "missing_or_invalid_execution_price",
+            "execution_price_return_chain_fallback",
             "eligible_rows",
             "overlap_rows",
             "overlap_close_mismatch",
@@ -712,7 +834,7 @@ def main():
 
     conn = sqlite3.connect(args.database)
     try:
-        ensure_tables_exist(conn)
+        ensure_tables_exist(conn, apply=args.apply)
         totals = Counter()
         for path in files:
             if (

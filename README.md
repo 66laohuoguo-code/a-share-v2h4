@@ -15,7 +15,7 @@
 - **历史费用分段**：按交易日期计算印花税、经手费、监管费和过户费。
 - **公司行动记账**：使用总回报与资本回报重建现金分红和送转股影响。
 - **低换手组合**：周频再平衡、买卖排名缓冲和无交易区间共同控制换手。
-- **实盘辅助接口**：读取已有持仓与现金，输出下一交易日订单建议和预计持仓。
+- **多账户实盘辅助**：按账户隔离持仓、净值峰值、风险状态和订单输出。
 - **可复现工程**：配置文件、示例账户、自动对比表、单元测试和 GitHub Actions 齐全。
 
 ## 系统流程
@@ -113,12 +113,32 @@ data/raw/market_data/
 
 ```text
 TradingDate, Symbol, OpenPrice, ClosePrice, HighPrice, LowPrice,
-Volume, Amount, StateCode, ChangeRatio, TurnoverRate1
+Volume, Amount, StateCode, ChangeRatio, TurnoverRate1,
+AValue, ACirculatedShare
 ```
 
-它会用本文件首日之前的数据库最新收盘价续接 `ChangeRatio`，因此可以安全处理每周文件以及与数据库重叠的日期。使用其他供应商时，需要实现相同 SQLite 表结构的数据适配器。
+对于 A 股，`AValue + ACirculatedShare` 是优先下载口径。若页面不提供这两个字段，则同时下载 `MarketValue + TotalShare` 和 `CirculatedMarketValue + CirculatedShare`，不要只选其中一组。下载前复权数据是允许的，但前推行情的 `ClosePrice` 是“交易所原价乘累计复权因子”，不能直接用于真实订单，也不能把不同下载批次的价格列直接拼接。导入器优先以 `AValue / ACirculatedShare`（元/股）还原 A 股未复权收盘价；备用的两种公司市值口径若不一致，会改用上一真实收盘价续接当日 `ChangeRatio` 并在导入日志中计数。数据库同时保留连续信号价和未复权执行价：因子使用前者，周调仓估值、整手取整和参考价格使用后者。
+
+`TRD_Dalyr（日个股回报率文件）` 的未复权 `Opnprc/Hiprc/Loprc/Clsprc` 是更直接的真实价格来源。不过当前 `import_csmar_forward_quotation.py` 只接收前/后复权行情字段；在项目增加 `TRD_Dalyr` 适配器前，不要把该表直接放进本目录混合导入。
+
+导入器会用本文件首日之前的数据库最新收盘价续接 `ChangeRatio`，因此可以安全处理每周文件以及与数据库重叠的日期。使用其他供应商时，需要实现相同 SQLite 表结构的数据适配器。
 
 ## 建立数据库
+
+### 从完整 CSMAR 导出重建
+
+完整的 `TRD_Dalyr`、`TRD_AdjustFactor`、`TRD_Co` 和 `TRD_NoLimit` 工作簿可用流式建库器导入，不会一次性把百万行 Excel 载入内存：
+
+```powershell
+python build_csmar_database.py `
+  --source-dir "data/raw/CSMAR raw data" `
+  --database "data/processed/csmar_stock_daily_full.sqlite" `
+  --start-date "2019-01-01" `
+  --end-date "2026-07-17" `
+  --reset
+```
+
+建库器只保留沪深京 A 股，以未复权 OHLC 作为成交价格，使用含现金红利再投资回报和不含现金红利回报分别记录总回报与资本回报，并导入复权因子和无涨跌停日期。若 `TRD_Co` 没有行业字段，程序会临时沿用旧数据库行业映射；正式回测前应补齐完整公司行业元数据。
 
 ```powershell
 python clean_resset_data.py `
@@ -158,16 +178,19 @@ python factor_rank_backtest_v2h.py `
   --output-dir outputs/backtest/v2h4
 ```
 
-Windows 下也可以一次运行基准、候选参数和滑点压力测试：
+Windows 下也可以依次运行正式策略、旧版对照和可选的滑点压力测试，并开启断点续跑：
 
 ```powershell
 .\run_v2h4_validation.ps1 `
   -Database data/processed/stock_daily.sqlite `
   -StartDate 2021-01-05 `
-  -IncludeStress
+  -IncludeStress `
+  -EnableCheckpoints `
+  -CheckpointEveryNDays 5 `
+  -Resume
 ```
 
-结束日期留空时，脚本自动使用数据库最大交易日。完成后生成：
+结束日期留空时，脚本自动使用数据库最大交易日。运行中按一次 `Ctrl+C`，程序会完成当前交易日、保存检查点并退出；重新执行同一条带 `-Resume` 的命令即可继续。数据库、策略参数、日期范围或代码发生变化时，旧检查点会被拒绝，防止混用不一致的状态。已经完整生成汇总 JSON 和工作簿的阶段会自动跳过。完成后生成：
 
 ```text
 outputs/validation_full/v2h4_comparison.xlsx
@@ -177,11 +200,13 @@ outputs/validation_full/v2h4_comparison.xlsx
 
 ## 已有持仓调仓
 
-先复制账户模板：
+先为每个账户指定一个稳定的账户 ID，并分别复制持仓模板：
 
 ```powershell
-Copy-Item data/input/positions.example.csv data/input/positions.csv
-Copy-Item data/input/account_state.example.json data/input/account_state.json
+New-Item -ItemType Directory -Force data/input/accounts/account_a
+New-Item -ItemType Directory -Force data/input/accounts/account_b
+Copy-Item data/input/positions.example.csv data/input/accounts/account_a/positions.csv
+Copy-Item data/input/positions.example.csv data/input/accounts/account_b/positions.csv
 ```
 
 持仓格式：
@@ -197,10 +222,13 @@ CASH,现金,235000,
 ```powershell
 python weekly_rebalance_v2h.py `
   --database data/processed/stock_daily.sqlite `
-  --positions data/input/positions.csv `
+  --account-id account_a `
+  --positions data/input/accounts/account_a/positions.csv `
   --strategy-config config/v2h4_strategy.json `
-  --output-dir outputs/weekly_rebalance
+  --output-dir outputs/weekly_rebalance_v2h4/account_a
 ```
+
+状态文件默认写入 `data/input/accounts/account_a/account_state.json`。每个账户的历史峰值与回撤状态完全独立；状态文件中的账户 ID 不匹配时，程序会拒绝运行。
 
 Windows 用户也可以把行情导入、数据库检查和调仓合并运行：
 
@@ -212,9 +240,11 @@ powershell.exe `
   -Python .\.venv\Scripts\python.exe `
   -Database data\processed\stock_daily.sqlite `
   -SourceDir data\raw\market_data `
-  -Positions data\input\positions.csv `
+  -AccountId account_a `
   -Year (Get-Date).Year
 ```
+
+`run_weekly.ps1` 会自动读取 `data/input/accounts/account_a/positions.csv`，并把结果写入 `outputs/weekly_rebalance_v2h4/account_a/`。第二个账户使用不同的 `AccountId` 再运行一次即可。
 
 输出包含：
 
@@ -222,6 +252,8 @@ powershell.exe `
 - `orders`：建议买卖方向、股数和参考价格；
 - `projected_positions`：假设全部成交后的预计持仓；
 - `factor_ranking`：股票池及六项因子排名。
+
+`orders.reference_close` 是决策日未复权市场收盘价；`indicative_price` 是在该收盘价上加入配置滑点、并按 `0.01` 元价位取整后的资金预算价。它不是下一交易日的保证成交价，也不要求把它原样作为限价委托。
 
 具体周末流程见 [WEEKLY_FRIDAY_GUIDE.md](WEEKLY_FRIDAY_GUIDE.md)。
 

@@ -1,11 +1,19 @@
+import argparse
 import json
 import sqlite3
-import sys
 from pathlib import Path
 
 
 def main():
-    db_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data/processed/resset_stock_daily.sqlite")
+    parser = argparse.ArgumentParser(description="Validate a cleaned stock_daily database.")
+    parser.add_argument("database_path", nargs="?", type=Path)
+    parser.add_argument("--database", dest="database_option", type=Path)
+    args = parser.parse_args()
+    db_path = (
+        args.database_option
+        or args.database_path
+        or Path("data/processed/resset_stock_daily.sqlite")
+    )
     conn = sqlite3.connect(db_path)
     checks = {
         "rows": conn.execute("SELECT COUNT(*) FROM stock_daily").fetchone()[0],
@@ -50,7 +58,8 @@ def main():
             "SELECT COUNT(*) FROM stock_daily WHERE turnover_total IS NULL"
         ).fetchone()[0],
         "missing_industry_rows": conn.execute(
-            "SELECT COUNT(*) FROM stock_daily WHERE industry_1 IS NULL OR TRIM(industry_1) = ''"
+            "SELECT COUNT(*) FROM stock_daily "
+            "WHERE industry_1 IS NULL OR TRIM(industry_1) = '' OR UPPER(industry_1) = 'UNKNOWN'"
         ).fetchone()[0],
         "latest_date_rows": conn.execute(
             "SELECT COUNT(*) FROM stock_daily WHERE trade_date = (SELECT MAX(trade_date) FROM stock_daily)"

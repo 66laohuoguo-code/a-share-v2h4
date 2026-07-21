@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,7 @@ from ashare_utils import (
     buy_order_size_rules,
     load_positions,
     mandatory_trade_cost,
+    round_price_to_tick,
     round_portfolio_target_shares,
     round_target_shares_for_code,
     trade_value_floor,
@@ -32,10 +34,10 @@ from ashare_utils import (
 
 
 DEFAULT_DATABASE = Path("data/processed/stock_daily.sqlite")
-DEFAULT_POSITIONS = Path("data/input/positions.csv")
-DEFAULT_ACCOUNT_STATE = Path("data/input/account_state.json")
+DEFAULT_ACCOUNTS_DIR = Path("data/input/accounts")
 DEFAULT_STRATEGY_CONFIG = Path("config/v2h4_strategy.json")
 DEFAULT_OUTPUT_DIR = Path("outputs/weekly_rebalance_v2h4")
+ACCOUNT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 def safe_float(value, default=np.nan):
@@ -60,10 +62,38 @@ def json_ready(value):
     return value
 
 
-def load_account_state(path: Path) -> Dict[str, object]:
+def validate_account_id(account_id: str) -> str:
+    account_id = str(account_id).strip()
+    if not ACCOUNT_ID_PATTERN.fullmatch(account_id):
+        raise ValueError(
+            "Account ID must be 1-64 ASCII letters, digits, dots, underscores or hyphens "
+            "and must start with a letter or digit."
+        )
+    return account_id
+
+
+def default_account_state_path(account_id: str) -> Path:
+    return DEFAULT_ACCOUNTS_DIR / validate_account_id(account_id) / "account_state.json"
+
+
+def load_account_state(path: Path, expected_account_id: str) -> Dict[str, object]:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(state, dict):
+        raise ValueError(f"Account state must be a JSON object: {path}")
+    stored_account_id = str(state.get("account_id", "")).strip()
+    if not stored_account_id:
+        raise ValueError(
+            f"Account state has no account_id and may belong to another account: {path}. "
+            "Use a new account-specific state path or remove this legacy state after checking it."
+        )
+    if stored_account_id != expected_account_id:
+        raise ValueError(
+            f"Account state mismatch: requested {expected_account_id!r}, but {path} belongs to "
+            f"{stored_account_id!r}."
+        )
+    return state
 
 
 def save_account_state(path: Path, state: Mapping[str, object]) -> None:
@@ -82,6 +112,34 @@ def latest_as_of_date(conn, requested=None):
     if not row or not row[0]:
         raise ValueError("The database contains no trading date at or before the requested as-of date.")
     return str(row[0])
+
+
+def load_execution_prices(conn, start_date, end_date):
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(stock_daily)")}
+    required = {"raw_prev_close", "raw_open", "raw_high", "raw_low", "raw_close"}
+    missing = sorted(required - columns)
+    if missing:
+        raise ValueError(
+            "The database does not yet contain real market-price columns. Run the weekly "
+            "forward importer with --apply once before generating orders. Missing: "
+            + ", ".join(missing)
+        )
+    return pd.read_sql_query(
+        """
+        SELECT code, name, trade_date,
+               raw_prev_close AS prev_close,
+               raw_open AS open,
+               raw_high AS high,
+               raw_low AS low,
+               raw_close AS close,
+               industry_1, industry_2
+        FROM stock_daily
+        WHERE trade_date BETWEEN ? AND ?
+        """,
+        conn,
+        params=(start_date, end_date),
+        parse_dates=[],
+    )
 
 
 def close_weights(holdings, prices, total_value, last_known_close=None):
@@ -137,7 +195,10 @@ def build_order_plan(
             continue
         current_shares = int(holdings.get(code, 0))
         side = "BUY" if float(target_weight) * total_value > current_shares * close else "SELL"
-        target_prices[code] = close * (1.0 + slippage if side == "BUY" else 1.0 - slippage)
+        target_prices[code] = round_price_to_tick(
+            close * (1.0 + slippage if side == "BUY" else 1.0 - slippage),
+            side,
+        )
     target_shares_by_code = round_portfolio_target_shares(targets, total_value, target_prices)
 
     for code in sorted(set(holdings).union(targets)):
@@ -151,8 +212,6 @@ def build_order_plan(
             continue
         current_shares = int(holdings.get(code, 0))
         target_weight = max(0.0, float(targets.get(code, 0.0)))
-        indicative_side = "BUY" if target_weight * total_value > current_shares * close else "SELL"
-        indicative_price = close * (1.0 + slippage if indicative_side == "BUY" else 1.0 - slippage)
         target_shares = int(target_shares_by_code.get(code, 0)) if target_weight > 0 else 0
         difference = int(target_shares - current_shares)
         if difference == 0:
@@ -175,7 +234,10 @@ def build_order_plan(
         )
         if trade_shares <= 0:
             continue
-        price = close * (1.0 + slippage if side == "BUY" else 1.0 - slippage)
+        price = round_price_to_tick(
+            close * (1.0 + slippage if side == "BUY" else 1.0 - slippage),
+            side,
+        )
         avg_amount = safe_float(feature_by_code.get(code, {}).get("avg_amount_60"), np.nan)
         if math.isfinite(avg_amount) and avg_amount > 0 and float(strategy_args.max_participation_rate) > 0:
             max_requested = int(math.floor(avg_amount * float(strategy_args.max_participation_rate) / price))
@@ -320,6 +382,18 @@ def build_order_plan(
 
 
 def run(args):
+    account_id = validate_account_id(args.account_id)
+    positions_path = Path(args.positions)
+    account_state_path = (
+        Path(args.account_state)
+        if args.account_state is not None
+        else default_account_state_path(account_id)
+    )
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir is not None
+        else DEFAULT_OUTPUT_DIR / account_id
+    )
     strategy_argv = ["--strategy-config", str(args.strategy_config)]
     strategy_args = v2h.parse_args(strategy_argv)
     conn = sqlite3.connect(args.database)
@@ -333,16 +407,32 @@ def run(args):
         history_start = dates[max(0, as_of_index - prehistory)]
         prices = base.load_prices(conn, history_start, as_of_date)
         prices["code"] = prices["code"].astype(str).str.zfill(6)
-        today = prices.loc[prices["trade_date"].astype(str).eq(as_of_date)].copy()
+        execution_prices = load_execution_prices(conn, history_start, as_of_date)
+        execution_prices["code"] = execution_prices["code"].astype(str).str.zfill(6)
+        execution_prices["close"] = pd.to_numeric(execution_prices["close"], errors="coerce")
+        today = execution_prices.loc[
+            execution_prices["trade_date"].astype(str).eq(as_of_date)
+            & execution_prices["close"].gt(0)
+        ].copy()
+        if today.empty:
+            raise ValueError(
+                f"No real ClosePrice values are available for {as_of_date}. Re-run "
+                "import_csmar_forward_quotation.py with --force-reimport --apply."
+            )
         price_map = today.set_index("code").to_dict("index")
-        latest_rows = prices.sort_values(["code", "trade_date"]).groupby("code", as_index=False).tail(1)
+        latest_rows = (
+            execution_prices.loc[execution_prices["close"].gt(0)]
+            .sort_values(["code", "trade_date"])
+            .groupby("code", as_index=False)
+            .tail(1)
+        )
         last_known_close = latest_rows.set_index("code")["close"].apply(safe_float).to_dict()
         market_state = base.build_market_state(prices, strategy_args)
         financial = base.load_financial_factors(conn)
         industry_events = base.load_industry_event_scores(strategy_args.industry_event_scores)
         event_regime = base.load_event_regime_signals(strategy_args.event_regime_signals)
 
-        positions, positions_cash = load_positions(Path(args.positions))
+        positions, positions_cash = load_positions(positions_path)
         cash = float(args.cash) if args.cash is not None else float(positions_cash)
         holdings = {
             str(row.code).zfill(6): int(round(float(row.shares)))
@@ -351,9 +441,13 @@ def run(args):
         }
         total_value = base.value_portfolio(holdings, cash, price_map, "close", last_known_close)
         if total_value <= 0:
-            raise ValueError("Current portfolio value is zero. Add CASH and/or stock positions before running.")
+            raise ValueError(
+                f"Account {account_id!r} has zero portfolio value because its positions file "
+                f"contains no positive stock shares or CASH amount: {positions_path}. "
+                "Fill this account-specific file with the broker's actual positions and available cash."
+            )
 
-        account_state = load_account_state(Path(args.account_state))
+        account_state = load_account_state(account_state_path, account_id)
         stored_peak = safe_float(account_state.get("peak_portfolio_value"), np.nan)
         requested_peak = safe_float(args.peak_value, np.nan)
         peak_value = requested_peak if math.isfinite(requested_peak) and requested_peak > 0 else stored_peak
@@ -373,6 +467,9 @@ def run(args):
         features = base.feature_snapshot(prices, financial, as_of_date, strategy_args, industry_events)
         features = v2h.apply_v2_score(features, v2h.STATIC_COMPONENT_WEIGHTS, strategy_args)
         features["rank"] = np.arange(1, len(features) + 1)
+        features["execution_close"] = features["code"].map(
+            today.set_index("code")["close"].to_dict()
+        )
         current_weights = close_weights(holdings, price_map, total_value, last_known_close)
         targets, target_meta = v2h.build_targets_v2(
             features,
@@ -405,16 +502,24 @@ def run(args):
             )
         if pd.Timestamp(as_of_date).weekday() < 3:
             warnings.append("The latest database date is early in the week; confirm that this is the intended weekly decision date.")
-        warnings.append("Indicative prices use the latest close plus/minus configured slippage; re-check limits, suspension and cash at the next open.")
+        warnings.append(
+            "reference_close is the latest unadjusted market close reconstructed from market "
+            "value / shares. indicative_price is only a "
+            "tick-rounded budget estimate using configured slippage, not a guaranteed or required order price."
+        )
 
         summary = {
+            "account_id": account_id,
             "strategy": str(getattr(strategy_args, "strategy_name", "V2H4")),
             "as_of_date": as_of_date,
             "database": str(args.database),
-            "positions_file": str(args.positions),
+            "positions_file": str(positions_path),
+            "account_state_file": str(account_state_path),
             "current_cash": cash,
             "current_stock_value": total_value - cash,
             "current_total_value": total_value,
+            "execution_price_source": "unadjusted close reconstructed from market value / shares",
+            "indicative_price_slippage_bps": float(strategy_args.slippage_bps),
             "peak_portfolio_value": peak_value,
             "portfolio_drawdown": float(regime["portfolio_drawdown"]),
             "market_state": str(regime["market_state"]),
@@ -459,10 +564,9 @@ def run(args):
             "warnings": warnings,
         }
 
-        output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        stem = f"v2h4_rebalance_{as_of_date.replace('-', '')}_{stamp}"
+        stem = f"v2h4_{account_id}_rebalance_{as_of_date.replace('-', '')}_{stamp}"
         paths = {
             "orders": output_dir / f"{stem}_orders.csv",
             "projected_positions": output_dir / f"{stem}_projected_positions.csv",
@@ -484,6 +588,7 @@ def run(args):
             "reversal_score",
             "lower_drawdown_score",
             "industry_trend_score",
+            "execution_close",
             "volatility_120",
             "avg_amount_60",
         ]
@@ -503,8 +608,10 @@ def run(args):
 
         if not args.no_update_account_state:
             save_account_state(
-                Path(args.account_state),
+                account_state_path,
                 {
+                    "account_id": account_id,
+                    "positions_file": str(positions_path),
                     "peak_portfolio_value": peak_value,
                     "last_portfolio_value": total_value,
                     "last_as_of_date": as_of_date,
@@ -512,6 +619,7 @@ def run(args):
                 },
             )
 
+        print(f"Account: {account_id}")
         print(f"As-of date: {as_of_date}")
         print(f"Current value: {total_value:.2f}")
         print(f"Target equity: {float(regime['target_equity_weight']):.2%}")
@@ -525,10 +633,11 @@ def run(args):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Generate a V2H4 next-session rebalance plan from current positions.")
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
-    parser.add_argument("--positions", type=Path, default=DEFAULT_POSITIONS)
-    parser.add_argument("--account-state", type=Path, default=DEFAULT_ACCOUNT_STATE)
+    parser.add_argument("--account-id", required=True, help="Stable ID used to isolate one brokerage account.")
+    parser.add_argument("--positions", type=Path, required=True)
+    parser.add_argument("--account-state", type=Path)
     parser.add_argument("--strategy-config", type=Path, default=DEFAULT_STRATEGY_CONFIG)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--as-of-date")
     parser.add_argument("--cash", type=float, help="Override CASH from the positions file for this run.")
     parser.add_argument("--peak-value", type=float, help="Override the stored historical peak portfolio value.")

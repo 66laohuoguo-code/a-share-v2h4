@@ -139,7 +139,7 @@ def price_limit_rate(code):
     code = str(code).zfill(6)
     if code.startswith(("300", "301", "688")):
         return 0.20
-    if code.startswith(("8", "4")):
+    if code.startswith(("8", "4", "920")):
         return 0.30
     return 0.10
 

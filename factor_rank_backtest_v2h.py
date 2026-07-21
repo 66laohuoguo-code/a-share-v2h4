@@ -13,8 +13,12 @@ point-in-time data loading and feature construction, then replaces four layers:
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
 import json
 import math
+import os
+import signal
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,6 +43,7 @@ from ashare_utils import (
 
 DEFAULT_DATABASE = Path("data/processed/stock_daily.sqlite")
 DEFAULT_OUTPUT_DIR = Path("outputs/backtest_v2")
+CHECKPOINT_VERSION = 1
 
 # The original low-beta/industry mix, re-normalized so the weights sum to one.
 STATIC_COMPONENT_WEIGHTS: Dict[str, float] = {
@@ -50,6 +55,197 @@ STATIC_COMPONENT_WEIGHTS: Dict[str, float] = {
     "industry_trend_score": 0.12,
 }
 EVENT_COMPONENT = "industry_event_score_ranked"
+
+
+class BacktestPaused(RuntimeError):
+    """Raised after a requested pause has been saved successfully."""
+
+
+def checkpoint_path_from_args(args) -> Optional[Path]:
+    configured = getattr(args, "checkpoint_file", None)
+    if configured:
+        return Path(configured).resolve()
+    if bool(getattr(args, "resume", False)):
+        return Path(args.output_dir).resolve() / "v2h_checkpoint.json.gz"
+    return None
+
+
+def checkpoint_metadata_path(path: Path) -> Path:
+    return path.with_name(path.name + ".meta.json")
+
+
+def checkpoint_fingerprint(args) -> str:
+    excluded = {"checkpoint_file", "checkpoint_every_n_days", "resume"}
+    arguments = {}
+    for key, value in sorted(vars(args).items()):
+        if key in excluded:
+            continue
+        if isinstance(value, Path):
+            value = str(value.resolve())
+        arguments[key] = value
+    database = Path(args.database).resolve()
+    stat = database.stat()
+    code_files = [Path(__file__).resolve(), Path(base.__file__).resolve()]
+    payload = {
+        "checkpoint_version": CHECKPOINT_VERSION,
+        "database": {
+            "path": str(database),
+            "size": int(stat.st_size),
+            "modified_ns": int(stat.st_mtime_ns),
+        },
+        "code_sha256": {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in code_files
+        },
+        "arguments": arguments,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def serialize_weighter(weighter: "RollingICWeighter") -> Dict[str, object]:
+    return {
+        "pending": [
+            {
+                "decision_date": item.decision_date,
+                "entry_date": item.entry_date,
+                "exit_date": item.exit_date,
+                "frame": item.frame.to_dict(orient="split"),
+            }
+            for item in weighter.pending
+        ],
+        "ic_rows": weighter.ic_rows,
+        "weight_rows": weighter.weight_rows,
+    }
+
+
+def restore_weighter(weighter: "RollingICWeighter", payload: Mapping[str, object]) -> None:
+    def restore_frame(item):
+        frame = item["frame"]
+        return pd.DataFrame(
+            frame["data"],
+            columns=frame["columns"],
+            index=frame.get("index"),
+        )
+
+    weighter.pending = [
+        PendingSnapshot(
+            str(item["decision_date"]),
+            str(item["entry_date"]),
+            str(item["exit_date"]),
+            restore_frame(item),
+        )
+        for item in payload.get("pending", [])
+    ]
+    weighter.ic_rows = list(payload.get("ic_rows", []))
+    weighter.weight_rows = list(payload.get("weight_rows", []))
+
+
+def make_checkpoint_state(
+    fingerprint: str,
+    next_offset: int,
+    test_dates: Sequence[str],
+    holdings: Mapping[str, int],
+    cash: float,
+    last_close: Mapping[str, float],
+    previous_total: float,
+    peak_total: float,
+    equity_rows: Sequence[Mapping[str, object]],
+    trade_rows: Sequence[Mapping[str, object]],
+    weighter: "RollingICWeighter",
+) -> Dict[str, object]:
+    return {
+        "version": CHECKPOINT_VERSION,
+        "fingerprint": fingerprint,
+        "next_offset": int(next_offset),
+        "total_dates": int(len(test_dates)),
+        "last_completed_date": test_dates[next_offset - 1] if next_offset > 0 else None,
+        "holdings": dict(holdings),
+        "cash": float(cash),
+        "last_close": dict(last_close),
+        "previous_total": float(previous_total),
+        "peak_total": float(peak_total),
+        "equity_rows": list(equity_rows),
+        "trade_rows": list(trade_rows),
+        "weighter": serialize_weighter(weighter),
+        "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+
+
+def checkpoint_json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if value is pd.NA:
+        return None
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    raise TypeError(f"Unsupported checkpoint value: {type(value).__name__}")
+
+
+def save_checkpoint(path: Path, state: Mapping[str, object], args) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    encoded = json.dumps(
+        dict(state),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=checkpoint_json_default,
+    ).encode("utf-8")
+    with temporary.open("wb") as handle:
+        handle.write(gzip.compress(encoded, compresslevel=3))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+    next_offset = int(state["next_offset"])
+    total_dates = int(state["total_dates"])
+    metadata = {
+        "status": "paused_or_running",
+        "strategy_name": str(getattr(args, "strategy_name", "V2H")),
+        "checkpoint_file": str(path),
+        "saved_at": state["saved_at"],
+        "last_completed_date": state.get("last_completed_date"),
+        "completed_dates": next_offset,
+        "total_dates": total_dates,
+        "progress_percent": round(100.0 * next_offset / max(total_dates, 1), 2),
+        "holding_count": len(state.get("holdings", {})),
+        "cash": float(state.get("cash", 0.0)),
+        "portfolio_value": float(state.get("previous_total", 0.0)),
+        "fingerprint": state["fingerprint"],
+    }
+    metadata_path = checkpoint_metadata_path(path)
+    metadata_temporary = metadata_path.with_name(metadata_path.name + ".tmp")
+    metadata_temporary.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(metadata_temporary, metadata_path)
+
+
+def load_checkpoint(path: Path, fingerprint: str, total_dates: int) -> Dict[str, object]:
+    state = json.loads(gzip.decompress(path.read_bytes()).decode("utf-8"))
+    if int(state.get("version", -1)) != CHECKPOINT_VERSION:
+        raise ValueError(
+            f"Checkpoint version mismatch in {path}; start a new checkpoint file."
+        )
+    if state.get("fingerprint") != fingerprint:
+        raise ValueError(
+            "Checkpoint does not match the current database, date range or strategy parameters: "
+            f"{path}"
+        )
+    if int(state.get("total_dates", -1)) != int(total_dates):
+        raise ValueError(f"Checkpoint trading-date count does not match this run: {path}")
+    next_offset = int(state.get("next_offset", -1))
+    if not 0 <= next_offset <= total_dates:
+        raise ValueError(f"Checkpoint contains an invalid next offset: {next_offset}")
+    return state
+
+
+def clear_checkpoint(path: Optional[Path]) -> None:
+    if path is None:
+        return
+    for target in (path, checkpoint_metadata_path(path)):
+        if target.exists():
+            target.unlink()
 
 
 def clip(value: float, lower: float, upper: float) -> float:
@@ -430,7 +626,8 @@ def select_lot_aware_codes(
     skipped_lot_too_expensive = 0
     for code in candidate_order:
         row = row_by_code.get(code, {})
-        close = safe_float(row.get("close"), np.nan)
+        close_field = "execution_close" if "execution_close" in row else "close"
+        close = safe_float(row.get(close_field), np.nan)
         if not math.isfinite(close) or close <= 0:
             continue
         minimum, _ = buy_order_size_rules(code)
@@ -930,6 +1127,7 @@ def write_outputs_v2(
 
 def run_backtest(args):
     conn = sqlite3.connect(args.database)
+    previous_sigint = None
     try:
         dates = base.trading_dates(conn)
         date_to_index = {date: idx for idx, date in enumerate(dates)}
@@ -954,6 +1152,9 @@ def run_backtest(args):
             components.append(EVENT_COMPONENT)
         weighter = RollingICWeighter(args, components)
 
+        checkpoint_path = checkpoint_path_from_args(args)
+        fingerprint = checkpoint_fingerprint(args)
+        start_offset = 0
         holdings: Dict[str, int] = {}
         cash = float(args.initial_cash)
         last_close: Dict[str, float] = {}
@@ -962,7 +1163,55 @@ def run_backtest(args):
         equity_rows: List[Dict[str, object]] = []
         trade_rows: List[Dict[str, object]] = []
 
-        for offset, trade_date in enumerate(test_dates):
+        if checkpoint_path and checkpoint_path.exists():
+            if not bool(args.resume):
+                raise FileExistsError(
+                    f"Checkpoint already exists; rerun with --resume or choose another file: {checkpoint_path}"
+                )
+            state = load_checkpoint(checkpoint_path, fingerprint, len(test_dates))
+            start_offset = int(state["next_offset"])
+            holdings = {str(code): int(shares) for code, shares in state["holdings"].items()}
+            cash = float(state["cash"])
+            last_close = {
+                str(code): float(close) for code, close in state["last_close"].items()
+            }
+            previous_total = float(state["previous_total"])
+            peak_total = float(state["peak_total"])
+            equity_rows = list(state["equity_rows"])
+            trade_rows = list(state["trade_rows"])
+            restore_weighter(weighter, state["weighter"])
+            if len(equity_rows) != start_offset:
+                raise ValueError(
+                    "Checkpoint equity history length does not match its next offset: "
+                    f"{len(equity_rows)} != {start_offset}"
+                )
+            print(
+                f"Resuming checkpoint: {start_offset}/{len(test_dates)} "
+                f"after {state.get('last_completed_date')} from {checkpoint_path}",
+                flush=True,
+            )
+        elif checkpoint_path:
+            print(f"No checkpoint found; starting a new resumable run: {checkpoint_path}", flush=True)
+
+        pause_requested = False
+
+        def request_pause(_signum, _frame):
+            nonlocal pause_requested
+            if pause_requested:
+                raise KeyboardInterrupt
+            pause_requested = True
+            print(
+                "Pause requested. Finishing the current trading day and saving a checkpoint; "
+                "press Ctrl+C again only to force an immediate stop.",
+                flush=True,
+            )
+
+        if checkpoint_path is not None:
+            previous_sigint = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, request_pause)
+        checkpoint_interval = max(1, int(args.checkpoint_every_n_days))
+
+        for offset, trade_date in enumerate(test_dates[start_offset:], start=start_offset):
             decision_date = dates[date_to_index[trade_date] - 1]
             today_prices = all_prices_by_date.get(trade_date, {})
             corporate_action_cash, corporate_actions = base.apply_corporate_actions_before_open(
@@ -1070,6 +1319,30 @@ def run_backtest(args):
             )
             previous_total = close_total
             peak_total = max(peak_total, close_total)
+            should_checkpoint = checkpoint_path is not None and (
+                (offset + 1) % checkpoint_interval == 0
+                or pause_requested
+                or offset == len(test_dates) - 1
+            )
+            if should_checkpoint:
+                state = make_checkpoint_state(
+                    fingerprint,
+                    offset + 1,
+                    test_dates,
+                    holdings,
+                    cash,
+                    last_close,
+                    previous_total,
+                    peak_total,
+                    equity_rows,
+                    trade_rows,
+                    weighter,
+                )
+                save_checkpoint(checkpoint_path, state, args)
+            if pause_requested:
+                raise BacktestPaused(
+                    f"Backtest paused safely after {trade_date}. Resume from {checkpoint_path}"
+                )
             if (offset + 1) % 20 == 0 or offset == len(test_dates) - 1:
                 print(
                     f"V2 progress: {offset + 1}/{len(test_dates)} {trade_date} "
@@ -1105,6 +1378,7 @@ def run_backtest(args):
             pd.DataFrame(weighter.ic_rows),
             args,
         )
+        clear_checkpoint(checkpoint_path)
         print(f"V2 workbook: {paths['workbook']}")
         print(f"Summary JSON: {paths['summary']}")
         print(f"Final value: {summary['final_value']:.2f}")
@@ -1112,6 +1386,8 @@ def run_backtest(args):
         print(f"Average actual equity: {summary['average_actual_equity_weight']:.2%}")
         return summary, paths
     finally:
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
         conn.close()
 
 
@@ -1217,6 +1493,13 @@ def parse_args(argv=None):
     parser.add_argument("--max-participation-rate", type=float, default=0.05)
     parser.add_argument("--disable-limit-trade-filter", action="store_true")
     parser.add_argument("--limit-trade-buffer", type=float, default=0.005)
+    parser.add_argument("--checkpoint-file", type=Path)
+    parser.add_argument("--checkpoint-every-n-days", type=int, default=5)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a matching checkpoint, or start a new resumable run when none exists.",
+    )
     preliminary, _ = parser.parse_known_args(argv)
     if preliminary.strategy_config:
         config_path = Path(preliminary.strategy_config)
@@ -1230,4 +1513,8 @@ def parse_args(argv=None):
 
 
 if __name__ == "__main__":
-    run_backtest(parse_args())
+    try:
+        run_backtest(parse_args())
+    except BacktestPaused as exc:
+        print(str(exc), flush=True)
+        raise SystemExit(75)

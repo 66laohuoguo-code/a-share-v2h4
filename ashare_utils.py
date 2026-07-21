@@ -139,6 +139,18 @@ def buy_order_size_rules(code):
     )
 
 
+def round_price_to_tick(price, side):
+    """Round an indicative A-share price conservatively to the valid price tick."""
+    price = float(price)
+    tick = float(A_SHARE_TRADING_RULES["price_tick"])
+    units = price / tick
+    if str(side).upper() == "BUY":
+        result = math.ceil(units - 1e-10) * tick
+    else:
+        result = math.floor(units + 1e-10) * tick
+    return round(result, 2)
+
+
 def round_target_shares_for_code(target_value, price, code):
     if price is None or pd.isna(price) or price <= 0:
         return 0

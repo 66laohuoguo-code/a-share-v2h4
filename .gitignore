@@ -24,7 +24,9 @@ data/input/*
 
 # Generated research and temporary files
 outputs/
+output/
 work/
+tmp/
 *.sqlite
 *.sqlite-*
 *.db
@@ -47,6 +49,8 @@ Thumbs.db
 24101102437黄子嫚-汉语言文学师范-旅映非遗微度假平台/
 24101102437黄子嫚-汉语言文学师范-旅映非遗微度假平台.zip
 benchmark_plan.docx
+vibe_coding_tutorial/
+vibe_coding_zero_beginner/
 
 # Internal research history and deprecated experiments are not part of the public product
 README_V2.md

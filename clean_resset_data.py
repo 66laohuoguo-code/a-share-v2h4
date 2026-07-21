@@ -21,6 +21,11 @@ OUTPUT_COLUMNS = [
     "high",
     "low",
     "close",
+    "raw_prev_close",
+    "raw_open",
+    "raw_high",
+    "raw_low",
+    "raw_close",
     "adj_close_1",
     "adj_close_2",
     "volume",
@@ -290,6 +295,11 @@ def clean_record(row, column_map, source_file, source_sheet):
         else:
             record[field] = clean_text(value)
 
+    # Historical RESSET OHLC fields are exchange-scale prices. Keep a separate
+    # execution-price copy so later forward-adjusted imports can share one schema.
+    for field in ("prev_close", "open", "high", "low", "close"):
+        record[f"raw_{field}"] = record[field]
+
     return record
 
 
@@ -343,6 +353,11 @@ def connect_database(path, reset=False):
             high REAL,
             low REAL,
             close REAL,
+            raw_prev_close REAL,
+            raw_open REAL,
+            raw_high REAL,
+            raw_low REAL,
+            raw_close REAL,
             adj_close_1 REAL,
             adj_close_2 REAL,
             volume REAL,
@@ -364,6 +379,10 @@ def connect_database(path, reset=False):
         )
         """
     )
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(stock_daily)")}
+    for column in ("raw_prev_close", "raw_open", "raw_high", "raw_low", "raw_close"):
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE stock_daily ADD COLUMN {column} REAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS stock_meta (
@@ -447,6 +466,11 @@ def insert_batch(conn, batch, imported_at):
             high=excluded.high,
             low=excluded.low,
             close=excluded.close,
+            raw_prev_close=excluded.raw_prev_close,
+            raw_open=excluded.raw_open,
+            raw_high=excluded.raw_high,
+            raw_low=excluded.raw_low,
+            raw_close=excluded.raw_close,
             adj_close_1=excluded.adj_close_1,
             adj_close_2=excluded.adj_close_2,
             volume=excluded.volume,
