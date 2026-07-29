@@ -18,8 +18,11 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import signal
 import sqlite3
+import zlib
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +33,7 @@ import pandas as pd
 
 import factor_rank_backtest as base
 from ashare_utils import (
+    apply_risk_alignment_trade_floor,
     buy_order_size_rules,
     mandatory_trade_cost,
     round_portfolio_target_shares,
@@ -44,6 +48,7 @@ from ashare_utils import (
 DEFAULT_DATABASE = Path("data/processed/stock_daily.sqlite")
 DEFAULT_OUTPUT_DIR = Path("outputs/backtest_v2")
 CHECKPOINT_VERSION = 1
+FEATURE_CACHE_VERSION = 1
 
 # The original low-beta/industry mix, re-normalized so the weights sum to one.
 STATIC_COMPONENT_WEIGHTS: Dict[str, float] = {
@@ -59,6 +64,157 @@ EVENT_COMPONENT = "industry_event_score_ranked"
 
 class BacktestPaused(RuntimeError):
     """Raised after a requested pause has been saved successfully."""
+
+
+class PriceDateStore:
+    """Build daily price dictionaries on demand instead of duplicating the full database."""
+
+    def __init__(self, prices: pd.DataFrame, max_cached_dates: int = 32):
+        self.prices = prices.reset_index(drop=True)
+        self.max_cached_dates = max(1, int(max_cached_dates))
+        self.positions_by_date = {
+            str(date): np.asarray(positions, dtype=np.int64)
+            for date, positions in self.prices.groupby("trade_date", sort=False).indices.items()
+        }
+        self.cache: OrderedDict[str, Dict[str, Dict[str, object]]] = OrderedDict()
+
+    def get(self, date: str, default=None):
+        key = str(date)
+        cached = self.cache.pop(key, None)
+        if cached is not None:
+            self.cache[key] = cached
+            return cached
+        positions = self.positions_by_date.get(key)
+        if positions is None:
+            return default
+        daily = self.prices.iloc[positions].set_index("code").to_dict("index")
+        self.cache[key] = daily
+        while len(self.cache) > self.max_cached_dates:
+            self.cache.popitem(last=False)
+        return daily
+
+
+def feature_cache_fingerprint(args) -> str:
+    database = Path(args.database).resolve()
+    stat = database.stat()
+    feature_arguments = {}
+    for key in [
+        "feature_history_days",
+        "min_history_days",
+        "min_avg_amount",
+        "min_market_cap_quantile",
+        "market_cap_proxy_window",
+        "disable_industry_neutral_factors",
+        "industry_event_scores",
+    ]:
+        value = getattr(args, key, None)
+        if isinstance(value, Path):
+            path = value.resolve()
+            value = str(path)
+            if path.exists():
+                path_stat = path.stat()
+                value = {
+                    "path": str(path),
+                    "size": int(path_stat.st_size),
+                    "modified_ns": int(path_stat.st_mtime_ns),
+                }
+        feature_arguments[key] = value
+    payload = {
+        "feature_cache_version": FEATURE_CACHE_VERSION,
+        "database": {
+            "path": str(database),
+            "size": int(stat.st_size),
+            "modified_ns": int(stat.st_mtime_ns),
+        },
+        "feature_code_sha256": hashlib.sha256(Path(base.__file__).resolve().read_bytes()).hexdigest(),
+        "arguments": feature_arguments,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+class FeatureSnapshotCache:
+    """Persistent compressed cache shared by capital and portfolio-count experiments."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path).resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.path, timeout=60.0)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feature_snapshots (
+                fingerprint TEXT NOT NULL,
+                decision_date TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                payload BLOB NOT NULL,
+                saved_at TEXT NOT NULL,
+                PRIMARY KEY (fingerprint, decision_date)
+            )
+            """
+        )
+        self.conn.commit()
+
+    def get(self, fingerprint: str, decision_date: str) -> Optional[pd.DataFrame]:
+        row = self.conn.execute(
+            """
+            SELECT payload
+            FROM feature_snapshots
+            WHERE fingerprint = ? AND decision_date = ?
+            """,
+            (str(fingerprint), str(decision_date)),
+        ).fetchone()
+        if row is None:
+            return None
+        return pickle.loads(zlib.decompress(row[0]))
+
+    def put(self, fingerprint: str, decision_date: str, frame: pd.DataFrame) -> None:
+        encoded = zlib.compress(pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL), level=3)
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO feature_snapshots
+                (fingerprint, decision_date, row_count, payload, saved_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(fingerprint),
+                str(decision_date),
+                int(len(frame)),
+                sqlite3.Binary(encoded),
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+            ),
+        )
+        self.conn.commit()
+
+    def count(self, fingerprint: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM feature_snapshots WHERE fingerprint = ?",
+            (str(fingerprint),),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def cached_feature_snapshot(
+    cache: Optional[FeatureSnapshotCache],
+    cache_fingerprint: Optional[str],
+    prices: pd.DataFrame,
+    financial: pd.DataFrame,
+    decision_date: str,
+    args,
+    industry_events: pd.DataFrame,
+) -> pd.DataFrame:
+    if cache is not None and cache_fingerprint is not None:
+        cached = cache.get(cache_fingerprint, decision_date)
+        if cached is not None:
+            return cached
+    features = base.feature_snapshot(prices, financial, decision_date, args, industry_events)
+    if cache is not None and cache_fingerprint is not None:
+        cache.put(cache_fingerprint, decision_date, features)
+    return features
 
 
 def checkpoint_path_from_args(args) -> Optional[Path]:
@@ -789,6 +945,7 @@ def build_targets_v2(
     args,
     target_equity_weight: float,
     portfolio_value: Optional[float] = None,
+    force_risk_alignment: bool = False,
 ) -> Tuple[Dict[str, float], Dict[str, object]]:
     if features.empty or target_equity_weight <= 0:
         return {}, {"selected_count": 0, "target_weight_sum": 0.0}
@@ -857,12 +1014,13 @@ def build_targets_v2(
 
     # Avoid spending money on trivial changes; keep target allocations otherwise.
     target = desired.to_dict()
-    band = max(0.0, float(args.rebalance_band_weight))
-    for code in list(set(target).union(current_weights)):
-        desired_weight = float(target.get(code, 0.0))
-        current_weight = float(current_weights.get(code, 0.0))
-        if abs(desired_weight - current_weight) < band:
-            target[code] = current_weight
+    if not force_risk_alignment:
+        band = max(0.0, float(args.rebalance_band_weight))
+        for code in list(set(target).union(current_weights)):
+            desired_weight = float(target.get(code, 0.0))
+            current_weight = float(current_weights.get(code, 0.0))
+            if abs(desired_weight - current_weight) < band:
+                target[code] = current_weight
     # Preserve the desired target when the band leaves a small residual; the execution
     # layer still controls cash, lots and liquidity.
     target = {code: float(weight) for code, weight in target.items() if float(weight) > 0}
@@ -872,13 +1030,114 @@ def build_targets_v2(
         "desired_equity_weight": float(target_equity_weight),
         "effective_max_stock_weight": float(effective_max_stock_weight),
         "effective_max_industry_weight": float(effective_max_industry_weight),
+        "force_risk_alignment": bool(force_risk_alignment),
         **lot_meta,
     }
+
+
+def should_force_risk_alignment(args, current_equity_weight: float, target_equity_weight: float) -> bool:
+    mode = str(getattr(args, "risk_target_alignment", "banded")).strip().lower()
+    if mode != "strict":
+        return False
+    return (
+        abs(float(current_equity_weight) - float(target_equity_weight))
+        > float(args.risk_rebalance_band)
+    )
+
+
+def should_run_unscheduled_risk_rebalance(
+    args,
+    current_equity_weight: float,
+    target_equity_weight: float,
+) -> bool:
+    schedule = str(getattr(args, "risk_rebalance_schedule", "daily")).strip().lower()
+    if schedule != "daily":
+        return False
+    return (
+        float(current_equity_weight)
+        > float(target_equity_weight) + float(args.risk_rebalance_band)
+    )
+
+
+def select_sparse_risk_alignment_orders(
+    planned: Sequence[Mapping[str, object]],
+    current_equity_weight: float,
+    target_equity_weight: float,
+    portfolio_value: float,
+    max_orders: int,
+    initial_max_orders: int = 0,
+) -> List[Dict[str, object]]:
+    items = [dict(item) for item in planned]
+    cap = max(0, int(max_orders))
+    if cap <= 0 or not items:
+        return items
+
+    risk_items = [
+        item
+        for item in items
+        if str(item.get("risk_alignment_mode", "")).upper() in {"REDUCE", "INCREASE"}
+    ]
+    if not risk_items:
+        return items
+
+    initial_cap = max(0, int(initial_max_orders))
+    if (
+        initial_cap > 0
+        and float(current_equity_weight) <= 0.01
+        and float(target_equity_weight) > 0.01
+    ):
+        cap = initial_cap
+
+    active_mode = (
+        "REDUCE"
+        if float(current_equity_weight) > float(target_equity_weight)
+        else "INCREASE"
+    )
+    active = [
+        item
+        for item in risk_items
+        if str(item.get("risk_alignment_mode", "")).upper() == active_mode
+    ]
+    if not active:
+        return items
+
+    active.sort(key=lambda item: float(item.get("gross_amount", 0.0)), reverse=True)
+    required_gross = (
+        abs(float(current_equity_weight) - float(target_equity_weight))
+        * max(0.0, float(portfolio_value))
+    )
+    chosen: List[Dict[str, object]] = []
+    cumulative_gross = 0.0
+    for item in active:
+        if len(chosen) >= cap:
+            break
+        chosen.append(item)
+        cumulative_gross += max(0.0, float(item.get("gross_amount", 0.0)))
+        if cumulative_gross + 1e-8 >= required_gross:
+            break
+
+    dropped = max(0, len(items) - len(chosen))
+    for item in chosen:
+        item["sparse_risk_execution"] = True
+        item["sparse_risk_orders_dropped"] = dropped
+        item["risk_alignment_order_cap"] = cap
+    return chosen
 
 
 def execution_price(open_price: float, side: str, slippage_bps: float) -> float:
     slip = max(0.0, float(slippage_bps)) / 10000.0
     return open_price * (1.0 + slip) if side == "BUY" else open_price * (1.0 - slip)
+
+
+def configured_trade_cost(gross: float, side: str, trade_date: str, code: str, args) -> float:
+    return mandatory_trade_cost(
+        gross,
+        side,
+        trade_date,
+        code,
+        broker_commission_rate=float(getattr(args, "broker_commission_rate", 0.0)),
+        broker_minimum_commission=float(getattr(args, "broker_minimum_commission", 0.0)),
+    )
 
 
 def execute_trades_v2(
@@ -909,6 +1168,12 @@ def execute_trades_v2(
         portfolio_open_value,
         target_prices,
     )
+    current_equity_weight = (
+        max(0.0, float(portfolio_open_value) - float(cash)) / float(portfolio_open_value)
+        if float(portfolio_open_value) > 0
+        else 0.0
+    )
+    target_equity_weight = float(sum(max(0.0, float(weight)) for weight in targets.values()))
     for code in sorted(set(holdings).union(targets)):
         row = prices.get(code)
         if row is None:
@@ -936,6 +1201,16 @@ def execute_trades_v2(
             getattr(args, "entry_exit_min_trade_value", None),
             getattr(args, "entry_exit_min_trade_weight", 0.0),
         )
+        order_floor, risk_alignment_mode = apply_risk_alignment_trade_floor(
+            order_floor,
+            portfolio_open_value,
+            side,
+            current_equity_weight,
+            target_equity_weight,
+            args.risk_rebalance_band,
+            getattr(args, "risk_reduction_min_trade_weight", 0.01),
+            getattr(args, "risk_increase_min_trade_weight", 0.01),
+        )
         gross = abs(trade_shares) * price
         if gross < order_floor:
             continue
@@ -961,6 +1236,9 @@ def execute_trades_v2(
                 "side": side,
                 "transition_type": transition_type,
                 "trade_value_floor": order_floor,
+                "risk_alignment_mode": risk_alignment_mode,
+                "risk_reduction_trade": risk_alignment_mode == "REDUCE",
+                "risk_increase_trade": risk_alignment_mode == "INCREASE",
                 "shares": abs(int(trade_shares)),
                 "open_price": raw_open,
                 "price": price,
@@ -970,6 +1248,15 @@ def execute_trades_v2(
                 "avg_amount_for_cap": avg_amount,
             }
         )
+
+    planned = select_sparse_risk_alignment_orders(
+        planned,
+        current_equity_weight,
+        target_equity_weight,
+        portfolio_open_value,
+        getattr(args, "risk_alignment_max_orders", 0),
+        getattr(args, "risk_alignment_initial_max_orders", 0),
+    )
 
     executed: List[Dict[str, object]] = []
     for order in [item for item in planned if item["side"] == "SELL"]:
@@ -986,7 +1273,7 @@ def execute_trades_v2(
         gross = shares * float(order["price"])
         if gross < float(order["trade_value_floor"]):
             continue
-        fee = mandatory_trade_cost(gross, "SELL", trade_date, code)
+        fee = configured_trade_cost(gross, "SELL", trade_date, code, args)
         holdings[code] = int(holdings.get(code, 0)) - shares
         if holdings[code] <= 0:
             holdings.pop(code, None)
@@ -1004,7 +1291,7 @@ def execute_trades_v2(
         shares = int(minimum + math.floor((shares - minimum) / increment) * increment)
         while shares >= minimum:
             gross = shares * float(order["price"])
-            fee = mandatory_trade_cost(gross, "BUY", trade_date, code)
+            fee = configured_trade_cost(gross, "BUY", trade_date, code, args)
             if gross + fee <= cash + 1e-8:
                 break
             shares -= increment
@@ -1013,7 +1300,7 @@ def execute_trades_v2(
         gross = shares * float(order["price"])
         if gross < float(order["trade_value_floor"]):
             continue
-        fee = mandatory_trade_cost(gross, "BUY", trade_date, code)
+        fee = configured_trade_cost(gross, "BUY", trade_date, code, args)
         cash -= gross + fee
         holdings[code] = int(holdings.get(code, 0)) + shares
         order.update({"shares": shares, "gross_amount": gross, "fee": fee, "cash_after": cash})
@@ -1062,6 +1349,8 @@ def make_summary(equity: pd.DataFrame, trades: pd.DataFrame, initial_cash: float
         "max_industry_weight": float(args.max_industry_weight),
         "dynamic_factor_weights": bool(args.dynamic_factor_weights),
         "slippage_bps": float(args.slippage_bps),
+        "broker_commission_rate": float(getattr(args, "broker_commission_rate", 0.0)),
+        "broker_minimum_commission": float(getattr(args, "broker_minimum_commission", 0.0)),
         "max_participation_rate": float(args.max_participation_rate),
         "rebalance_band_weight": float(args.rebalance_band_weight),
         "min_trade_value": float(args.min_trade_value),
@@ -1072,11 +1361,29 @@ def make_summary(equity: pd.DataFrame, trades: pd.DataFrame, initial_cash: float
             else float(args.entry_exit_min_trade_value)
         ),
         "entry_exit_min_trade_weight": float(getattr(args, "entry_exit_min_trade_weight", 0.0)),
+        "risk_reduction_min_trade_weight": float(
+            getattr(args, "risk_reduction_min_trade_weight", 0.01)
+        ),
+        "risk_increase_min_trade_weight": float(
+            getattr(args, "risk_increase_min_trade_weight", 0.01)
+        ),
+        "risk_target_alignment": str(
+            getattr(args, "risk_target_alignment", "banded")
+        ),
+        "risk_rebalance_schedule": str(
+            getattr(args, "risk_rebalance_schedule", "daily")
+        ),
+        "risk_alignment_max_orders": int(
+            getattr(args, "risk_alignment_max_orders", 0)
+        ),
+        "risk_alignment_initial_max_orders": int(
+            getattr(args, "risk_alignment_initial_max_orders", 0)
+        ),
         "enable_lot_aware_selection": bool(getattr(args, "enable_lot_aware_selection", False)),
         "lot_aware_min_holdings": int(getattr(args, "lot_aware_min_holdings", 5)),
         "lot_aware_max_stock_weight": float(getattr(args, "lot_aware_max_stock_weight", 0.25)),
         "lot_aware_max_industry_weight": float(getattr(args, "lot_aware_max_industry_weight", 0.50)),
-        "cost_model": "date-aware statutory A-share costs + configurable one-sided slippage + participation cap",
+        "cost_model": "date-aware statutory A-share costs + per-order broker commission + configurable one-sided slippage + participation cap",
         "corporate_action_model": "RESSET total-return/capital-return inferred cash distributions and share factors",
     }
 
@@ -1109,7 +1416,11 @@ def write_outputs_v2(
     factor_weights.to_csv(paths["factor_weights"], index=False, encoding="utf-8-sig")
     factor_ic.to_csv(paths["factor_ic"], index=False, encoding="utf-8-sig")
     payload = dict(summary)
-    payload["trading_costs"] = trading_cost_snapshot(summary.get("end_date"))
+    payload["trading_costs"] = trading_cost_snapshot(
+        summary.get("end_date"),
+        broker_commission_rate=summary.get("broker_commission_rate", 0.0),
+        broker_minimum_commission=summary.get("broker_minimum_commission", 0.0),
+    )
     paths["summary"].write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     write_excel_workbook(
         paths["workbook"],
@@ -1128,6 +1439,7 @@ def write_outputs_v2(
 def run_backtest(args):
     conn = sqlite3.connect(args.database)
     previous_sigint = None
+    feature_cache: Optional[FeatureSnapshotCache] = None
     try:
         dates = base.trading_dates(conn)
         date_to_index = {date: idx for idx, date in enumerate(dates)}
@@ -1138,13 +1450,65 @@ def run_backtest(args):
         history_start = dates[max(0, date_to_index[test_dates[0]] - prehistory)]
         prices = base.load_prices(conn, history_start, test_dates[-1])
         prices["code"] = prices["code"].astype(str).str.zfill(6)
-        market_state = base.build_market_state(prices, args)
-        all_prices_by_date = {
-            date: group.set_index("code").to_dict("index")
-            for date, group in prices.groupby("trade_date")
-        }
         financial = base.load_financial_factors(conn)
         industry_events = base.load_industry_event_scores(args.industry_event_scores)
+        feature_cache_path = getattr(args, "feature_cache", None)
+        cache_fingerprint = None
+        if feature_cache_path:
+            feature_cache = FeatureSnapshotCache(Path(feature_cache_path))
+            cache_fingerprint = feature_cache_fingerprint(args)
+
+        if bool(getattr(args, "build_feature_cache_only", False)):
+            if feature_cache is None or cache_fingerprint is None:
+                raise ValueError("--build-feature-cache-only requires --feature-cache.")
+            scheduled_dates = []
+            for offset, trade_date in enumerate(test_dates):
+                decision_date = dates[date_to_index[trade_date] - 1]
+                if should_rebalance_on_date(
+                    args.rebalance_schedule,
+                    offset,
+                    args.rebalance_every_n_days,
+                    dates,
+                    date_to_index,
+                    decision_date,
+                ):
+                    scheduled_dates.append(decision_date)
+            scheduled_dates = list(dict.fromkeys(scheduled_dates))
+            print(
+                f"Feature cache: {feature_cache.path} "
+                f"({feature_cache.count(cache_fingerprint)} snapshots already present)",
+                flush=True,
+            )
+            for index, decision_date in enumerate(scheduled_dates, start=1):
+                cached_feature_snapshot(
+                    feature_cache,
+                    cache_fingerprint,
+                    prices,
+                    financial,
+                    decision_date,
+                    args,
+                    industry_events,
+                )
+                if index % 5 == 0 or index == len(scheduled_dates):
+                    print(
+                        f"Feature-cache progress: {index}/{len(scheduled_dates)} {decision_date}",
+                        flush=True,
+                    )
+            print(
+                f"Feature cache complete: {len(scheduled_dates)} scheduled snapshots.",
+                flush=True,
+            )
+            return {
+                "feature_cache": str(feature_cache.path),
+                "feature_cache_fingerprint": cache_fingerprint,
+                "snapshot_count": len(scheduled_dates),
+            }
+
+        market_state = base.build_market_state(prices, args)
+        all_prices_by_date = PriceDateStore(
+            prices,
+            max_cached_dates=int(getattr(args, "price_date_cache_days", 32)),
+        )
         event_regime = base.load_event_regime_signals(args.event_regime_signals)
 
         components = list(STATIC_COMPONENT_WEIGHTS)
@@ -1229,14 +1593,26 @@ def run_backtest(args):
                 args.rebalance_schedule, offset, args.rebalance_every_n_days, dates, date_to_index, decision_date
             )
             current_equity = sum(current_weights.values())
-            risk_rebalance = current_equity > float(regime["target_equity_weight"]) + float(args.risk_rebalance_band)
+            risk_rebalance = should_run_unscheduled_risk_rebalance(
+                args,
+                current_equity,
+                float(regime["target_equity_weight"]),
+            )
             rebalanced = bool(scheduled or risk_rebalance)
             executed: List[Dict[str, object]] = []
             target_meta: Dict[str, object] = {"selected_count": 0, "target_weight_sum": 0.0}
             weight_info: Dict[str, object] = {"weight_mode": "not_rebalanced", "ic_observations": len(weighter.ic_rows)}
 
             if rebalanced:
-                features = base.feature_snapshot(prices, financial, decision_date, args, industry_events)
+                features = cached_feature_snapshot(
+                    feature_cache,
+                    cache_fingerprint,
+                    prices,
+                    financial,
+                    decision_date,
+                    args,
+                    industry_events,
+                )
                 factor_weights, weight_info = weighter.weights(decision_date)
                 features = apply_v2_score(features, factor_weights, args)
                 targets, target_meta = build_targets_v2(
@@ -1246,6 +1622,11 @@ def run_backtest(args):
                     args,
                     float(regime["target_equity_weight"]),
                     previous_total,
+                    force_risk_alignment=should_force_risk_alignment(
+                        args,
+                        current_equity,
+                        float(regime["target_equity_weight"]),
+                    ),
                 )
                 liquidity_by_code = features.set_index("code")["avg_amount_60"].to_dict() if not features.empty else {}
                 cash, executed = execute_trades_v2(
@@ -1388,6 +1769,8 @@ def run_backtest(args):
     finally:
         if previous_sigint is not None:
             signal.signal(signal.SIGINT, previous_sigint)
+        if feature_cache is not None:
+            feature_cache.close()
         conn.close()
 
 
@@ -1418,6 +1801,20 @@ def parse_args(argv=None):
     parser.add_argument("--min-trade-weight", type=float, default=0.0)
     parser.add_argument("--entry-exit-min-trade-value", type=float)
     parser.add_argument("--entry-exit-min-trade-weight", type=float, default=0.0)
+    parser.add_argument("--risk-reduction-min-trade-weight", type=float, default=0.01)
+    parser.add_argument("--risk-increase-min-trade-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--risk-target-alignment",
+        choices=["banded", "strict"],
+        default="banded",
+    )
+    parser.add_argument(
+        "--risk-rebalance-schedule",
+        choices=["daily", "scheduled_only"],
+        default="daily",
+    )
+    parser.add_argument("--risk-alignment-max-orders", type=int, default=0)
+    parser.add_argument("--risk-alignment-initial-max-orders", type=int, default=0)
     parser.add_argument("--enable-lot-aware-selection", action="store_true")
     parser.add_argument("--lot-aware-min-holdings", type=int, default=5)
     parser.add_argument("--lot-aware-stock-cap-multiplier", type=float, default=1.25)
@@ -1490,11 +1887,16 @@ def parse_args(argv=None):
 
     # Execution realism.
     parser.add_argument("--slippage-bps", type=float, default=5.0)
+    parser.add_argument("--broker-commission-rate", type=float, default=0.0003)
+    parser.add_argument("--broker-minimum-commission", type=float, default=5.0)
     parser.add_argument("--max-participation-rate", type=float, default=0.05)
     parser.add_argument("--disable-limit-trade-filter", action="store_true")
     parser.add_argument("--limit-trade-buffer", type=float, default=0.005)
     parser.add_argument("--checkpoint-file", type=Path)
     parser.add_argument("--checkpoint-every-n-days", type=int, default=5)
+    parser.add_argument("--feature-cache", type=Path)
+    parser.add_argument("--build-feature-cache-only", action="store_true")
+    parser.add_argument("--price-date-cache-days", type=int, default=32)
     parser.add_argument(
         "--resume",
         action="store_true",

@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "selection_basis": "current_total_value_at_latest_close",
+  "validated_min_value": 20000.0,
+  "validated_max_value": 10000000.0,
+  "tiers": [
+    {
+      "tier": "small_sparse_12",
+      "label": "Below CNY 50,000: 12-stock sparse weekly strategy",
+      "max_value_exclusive": 50000.0,
+      "strategy_config": "v2h4_small_account_20k_best_20260724_sparse_weekly.json"
+    },
+    {
+      "tier": "core_20",
+      "label": "CNY 50,000 to below CNY 750,000: 20-stock strategy",
+      "max_value_exclusive": 750000.0,
+      "strategy_config": "v2h4_strategy_10w_20stock_concentrated.json"
+    },
+    {
+      "tier": "capacity_25",
+      "label": "CNY 750,000 and above: 25-stock strategy",
+      "max_value_exclusive": null,
+      "strategy_config": "v2h4_strategy_10w_25stock_balanced.json"
+    }
+  ]
+}

@@ -43,8 +43,11 @@ flowchart LR
 ├── factor_rank_backtest_v2h.py     # V2H4 因果周频回测
 ├── weekly_rebalance_v2h.py         # 已有持仓的下一交易日调仓建议
 ├── compare_backtest_results.py     # 多组回测对比表
+├── capital_scale_analysis.py       # 不同资金规模的费用、容量与稳健排名
 ├── run_weekly.ps1                  # 每周导入、检查、调仓
 ├── run_v2h4_validation.ps1         # 基准、候选、压力测试
+├── run_20k_commission_validation.ps1 # 2 万元账户的费用与小资金候选对比
+├── run_capital_scale_validation.ps1 # 2 万至 1000 万元的策略规模扫描
 ├── config/                         # 正式、legacy 与压力候选配置
 ├── data/input/                     # 账户示例文件
 ├── tests/                          # 核心规则单元测试
@@ -175,6 +178,7 @@ python factor_rank_backtest_v2h.py `
   --database data/processed/stock_daily.sqlite `
   --start-date 2021-01-05 `
   --end-date 2026-07-10 `
+  --initial-cash 1000000 `
   --output-dir outputs/backtest/v2h4
 ```
 
@@ -198,18 +202,35 @@ outputs/validation_full/v2h4_comparison.xlsx
 
 仓库不提交本地回测结果。这样既避免数据许可问题，也要求使用者在自己的数据上复现结果，而不是只依赖一张静态收益图。
 
+### 券商佣金
+
+`config/v2h4_strategy.json` 中的 `broker_commission_rate` 和
+`broker_minimum_commission` 会同时作用于回测现金流、周调仓买入预算和输出摘要。
+仓库当前示例值分别为 `0.0003`（万分之三）和 `5.0` 元/笔；使用者必须改成自己的真实费率。
+法定税费仍按交易日期和交易方向另行计算，不能用券商佣金替代。
+
 ## 已有持仓调仓
 
-先为每个账户指定一个稳定的账户 ID，并分别复制持仓模板：
+每个真实账户都必须有一个稳定且唯一的账户 ID。账户 ID 只使用英文字母、数字、下划线或短横线，例如 `account_a`、`account_b`；建立后不要随意更名，因为它同时决定持仓、风险状态和输出目录。
+
+下面的命令创建两个相互隔离的账户：
 
 ```powershell
-New-Item -ItemType Directory -Force data/input/accounts/account_a
-New-Item -ItemType Directory -Force data/input/accounts/account_b
-Copy-Item data/input/positions.example.csv data/input/accounts/account_a/positions.csv
-Copy-Item data/input/positions.example.csv data/input/accounts/account_b/positions.csv
+$Accounts = @("account_a", "account_b")
+
+foreach ($AccountId in $Accounts) {
+  $AccountDir = "data/input/accounts/$AccountId"
+  New-Item -ItemType Directory -Force $AccountDir
+
+  if (-not (Test-Path "$AccountDir/positions.csv")) {
+    Copy-Item data/input/positions.example.csv "$AccountDir/positions.csv"
+  }
+}
 ```
 
-持仓格式：
+逐一编辑各自的 `positions.csv`，填写券商显示的真实持股、成本价和可用于买股的现金。不要在账户之间复制 `account_state.json`，也不要把一个账户的持仓文件交给另一个账户运行。
+
+持仓格式如下：
 
 ```csv
 code,name,shares,cost_price
@@ -217,34 +238,39 @@ code,name,shares,cost_price
 CASH,现金,235000,
 ```
 
-生成下一交易日建议：
+首次运行时，程序会在同一账户目录自动创建 `account_state.json`，用来记录该账户自己的净值峰值和回撤状态。以后每周应继续使用同一个账户 ID。
+
+不同账户可以使用不同策略。默认不需要手工指定配置：程序会用最新未复权收盘价计算“股票市值 + 可用现金”，再按当前账户总资产自动选择经过资金规模回测的策略。下面分别运行账户 A 和账户 B；第二次运行会跳过已经导入且没有变化的行情文件：
 
 ```powershell
-python weekly_rebalance_v2h.py `
-  --database data/processed/stock_daily.sqlite `
-  --account-id account_a `
-  --positions data/input/accounts/account_a/positions.csv `
-  --strategy-config config/v2h4_strategy.json `
-  --output-dir outputs/weekly_rebalance_v2h4/account_a
-```
-
-状态文件默认写入 `data/input/accounts/account_a/account_state.json`。每个账户的历史峰值与回撤状态完全独立；状态文件中的账户 ID 不匹配时，程序会拒绝运行。
-
-Windows 用户也可以把行情导入、数据库检查和调仓合并运行：
-
-```powershell
-powershell.exe `
-  -NoProfile `
-  -ExecutionPolicy Bypass `
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File .\run_weekly.ps1 `
   -Python .\.venv\Scripts\python.exe `
   -Database data\processed\stock_daily.sqlite `
   -SourceDir data\raw\market_data `
   -AccountId account_a `
   -Year (Get-Date).Year
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\run_weekly.ps1 `
+  -Python .\.venv\Scripts\python.exe `
+  -Database data\processed\stock_daily.sqlite `
+  -SourceDir data\raw\market_data `
+  -AccountId account_b `
+  -Year (Get-Date).Year
 ```
 
-`run_weekly.ps1` 会自动读取 `data/input/accounts/account_a/positions.csv`，并把结果写入 `outputs/weekly_rebalance_v2h4/account_a/`。第二个账户使用不同的 `AccountId` 再运行一次即可。
+自动资金分档保存在 `config/weekly_capital_strategy_map.json`：
+
+| 当前账户总资产 | 自动策略 |
+|---:|---|
+| 低于 5 万元 | 12 只稀疏周频版 |
+| 5 万元至低于 75 万元 | 20 只集中版 |
+| 75 万元及以上 | 25 只均衡版 |
+
+回测验证范围是 2 万至 1000 万元。超出范围时程序仍会选择最接近的一档，但会在 `warnings` 中提示容量外推。确需固定某个配置时，仍可传入 `-StrategyConfig <配置路径>`，它会覆盖自动选择。
+
+`run_weekly.ps1` 会自动读取 `data/input/accounts/<账户ID>/positions.csv`，把状态写入同一账户目录，并把结果写入 `outputs/weekly_rebalance_v2h4/<账户ID>/`。状态文件中的账户 ID 不匹配时，程序会拒绝运行。控制台、`summary` 和 `account_state.json` 都会记录本次选择的资金档位和策略配置。
 
 输出包含：
 
@@ -287,14 +313,82 @@ V2H4 静态因子权重：
 正式 `config/v2h4_strategy.json` 已采用按组合总资产缩放且能够实际成交的执行规则：
 
 - 普通持仓调整门槛：组合总资产的 2.0%；
-- 新建仓和完全清仓门槛：组合总资产的 0.35%；
+- 新建仓门槛：组合总资产的 0.35%；完全清仓不受最低成交额阻挡；
+- 当实际股票仓位高于风险目标超过 3% 时，卖出使用独立的 1% 风险降仓门槛；
+- 当实际股票仓位低于风险目标超过 3% 时，买入也使用独立的 1% 风险恢复门槛；
+- 当组合股票仓位偏离风险目标超过 3% 时，暂时绕过单股免调仓带，避免局部不交易规则阻挡组合风险预算；
 - 门槛基数是股票市值加现金的组合总资产，不是会随订单变化的可用现金；
 - 主板和创业板买入按 100 股整手，科创板和北交所使用各自申报规则；
 - 排名靠前但最小一手成本超过账户预算时，继续检查后续候选，而不是留下不可执行目标；
 - 小账户会自动减少目标持股数，并相应放宽单股和行业上限；
 - 组合级最大余数取整把剩余预算分配成额外整手，使实际股票仓位接近风险模型目标。
 
-共同区间回测中，整手自适应正式版累计收益 39.62%、年化 6.31%、Sharpe 0.707、最大回撤 7.79%。旧固定门槛版累计收益 40.39%、年化 6.41%、Sharpe 0.730、最大回撤 8.43%。正式版接受了很小的历史收益差异，换取跨账户规模可执行性和更低的完整区间回撤。
+历史结果如果没有计入真实券商佣金，不能与当前版本直接比较。特别是存在每笔最低佣金时，小额账户的订单数量和平均订单金额会显著影响净收益，应以重新运行后生成的汇总 JSON 和对比表为准。
+
+2 万元账户把已验证基准和后续实验分成独立配置，避免优化时覆盖历史最优版本：
+
+- `config/v2h4_small_account_20k_best_20260723.json`：冻结的 12 股 banded 基准；
+- `config/v2h4_small_account_20k_best_20260724_sparse_weekly.json`：当前表现最优的周度稀疏风险版本；
+- `config/v2h4_small_account_20k_strict_full_rejected_20260724.json`：严格全量风险对齐复现版，因订单和费用显著增加而被淘汰；
+- `config/v2h4_small_account_20k_sparse_weekly.json`：周度稀疏风险实验文件，冻结后的正式版本见上面的 `best_20260724` 文件。
+
+新候选必须在相同数据、相同初始资金和相同费用下回测，确认胜出后才能替换冻结基准：
+
+```powershell
+python factor_rank_backtest_v2h.py `
+  --strategy-config config/v2h4_small_account_20k_sparse_weekly.json `
+  --database data/processed/stock_daily.sqlite `
+  --start-date 2021-01-05 `
+  --initial-cash 20000 `
+  --output-dir outputs/validation_20k_sparse_weekly
+```
+
+约 10 万元的账户通常已经不属于“整手约束特别严重”的小资金账户，可以先使用正式 `config/v2h4_strategy.json`。但每笔最低 5 元佣金仍会影响小额订单，因此它仍属于需要关注费用的中等规模账户；是否需要专门减少持股数或换手，应通过相同费率下的 10 万元回测决定，而不是只按账户名义资金判断。
+
+### 资金规模扫描
+
+策略不能按最接近的已知账户金额直接套用。最低佣金、整手取整、持股分散度和流动性容量会随资金规模以不同速度变化。项目提供统一扫描脚本，在相同数据库、日期和费用口径下比较 12、20、25、40、60 和 80 股方法：
+
+先单独建立共享因子快照。因子计算只执行一次，后续全部资金和持股数实验读取同一个缓存：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\run_capital_scale_validation.ps1 `
+  -Python .\.venv\Scripts\python.exe `
+  -Database data\processed\stock_daily.sqlite `
+  -IncludeCapacityStress `
+  -BuildFeatureCacheOnly
+```
+
+内存允许时，可以在两个 PowerShell 窗口分别启动两个分片：
+
+```powershell
+# 窗口 A
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\run_capital_scale_validation.ps1 `
+  -Python .\.venv\Scripts\python.exe `
+  -Database data\processed\stock_daily.sqlite `
+  -IncludeCapacityStress `
+  -ShardCount 2 `
+  -ShardIndex 0 `
+  -Resume
+
+# 窗口 B
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\run_capital_scale_validation.ps1 `
+  -Python .\.venv\Scripts\python.exe `
+  -Database data\processed\stock_daily.sqlite `
+  -IncludeCapacityStress `
+  -ShardCount 2 `
+  -ShardIndex 1 `
+  -Resume
+```
+
+两个分片只读同一个行情库和共享因子缓存，但写入完全不同的输出目录。16GB 内存电脑不应使用超过两个并发进程；若单个新进程的工作集仍高于约 5GB，应改回 `ShardCount 1` 顺序运行。
+
+默认基础矩阵覆盖 2 万、5 万、10 万、20 万、50 万、100 万、500 万和 1000 万元；500 万和 1000 万元可额外运行 10/20 bps 滑点与 2%/1% 成交参与率压力测试。每个组合都有独立检查点，按一次 `Ctrl+C` 后重新执行同一分片命令即可继续。
+
+结果写入 `outputs/validation_csmar_capital_scale/`。对比工作簿同时报告完整区间和留出区间收益、Sharpe、回撤、费用、最低佣金触发率、平均订单金额和流动性参与率。自动稳健排名只用于缩小候选范围，最终选择仍需检查相邻资金规模是否给出一致结论。
 
 旧固定门槛配置保留在 `config/v2h4_fixed_floor_legacy.json`，只用于复现对照。运行正式版、legacy 和正式版 10 bps 压力测试：
 

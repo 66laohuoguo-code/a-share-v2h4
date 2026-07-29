@@ -26,6 +26,61 @@ class TradingRulesTest(unittest.TestCase):
             0.0005641,
         )
 
+    def test_broker_commission_rate_and_minimum_are_applied_per_order(self):
+        buy_small = ashare_utils.mandatory_trade_cost(
+            1_000.0,
+            "BUY",
+            "2024-01-05",
+            "000001",
+            broker_commission_rate=0.0003,
+            broker_minimum_commission=5.0,
+        )
+        sell_large = ashare_utils.mandatory_trade_cost(
+            20_000.0,
+            "SELL",
+            "2024-01-05",
+            "000001",
+            broker_commission_rate=0.0003,
+            broker_minimum_commission=5.0,
+        )
+
+        self.assertAlmostEqual(buy_small, 5.0641)
+        self.assertAlmostEqual(sell_large, 17.282)
+
+    def test_official_strategy_records_personal_broker_costs(self):
+        args = factor_rank_backtest_v2h.parse_args(
+            ["--strategy-config", "config/v2h4_strategy.json"]
+        )
+        self.assertEqual(args.broker_commission_rate, 0.0003)
+        self.assertEqual(args.broker_minimum_commission, 5.0)
+        self.assertEqual(args.risk_reduction_min_trade_weight, 0.01)
+        self.assertEqual(args.risk_increase_min_trade_weight, 0.01)
+
+    def test_10w_causal_strategy_only_rebalances_from_the_prior_week(self):
+        args = factor_rank_backtest_v2h.parse_args(
+            ["--strategy-config", "config/v2h4_strategy_10w_weekly_causal.json"]
+        )
+        dates = ["2020-12-31", "2021-01-04", "2021-01-05"]
+        date_to_index = {date: index for index, date in enumerate(dates)}
+
+        self.assertEqual(args.rebalance_schedule, "week_end")
+        self.assertEqual(args.risk_rebalance_schedule, "scheduled_only")
+        self.assertTrue(
+            ashare_utils.should_rebalance_on_date(
+                args.rebalance_schedule,
+                0,
+                args.rebalance_every_n_days,
+                dates,
+                date_to_index,
+                "2020-12-31",
+            )
+        )
+        self.assertFalse(
+            factor_rank_backtest_v2h.should_run_unscheduled_risk_rebalance(
+                args, 0.80, 0.55
+            )
+        )
+
     def test_board_order_sizes(self):
         self.assertEqual(ashare_utils.buy_order_size_rules("000001"), (100, 100))
         self.assertEqual(ashare_utils.buy_order_size_rules("688001"), (200, 1))
@@ -57,8 +112,47 @@ class TradingRulesTest(unittest.TestCase):
         )
 
         self.assertEqual((entry_floor, entry_type), (2_000.0, "ENTRY"))
-        self.assertEqual((exit_floor, exit_type), (2_000.0, "EXIT"))
+        self.assertEqual((exit_floor, exit_type), (0.0, "EXIT"))
         self.assertEqual((adjust_floor, adjust_type), (20_000.0, "ADJUST"))
+
+    def test_risk_alignment_uses_separate_lower_buy_and_sell_floors(self):
+        sell_floor, sell_mode = ashare_utils.apply_risk_alignment_trade_floor(
+            order_floor=1_500.0,
+            portfolio_value=20_000.0,
+            side="SELL",
+            current_equity_weight=0.80,
+            target_equity_weight=0.55,
+            risk_rebalance_band=0.03,
+            risk_reduction_min_trade_weight=0.01,
+            risk_increase_min_trade_weight=0.01,
+        )
+        buy_floor, buy_mode = ashare_utils.apply_risk_alignment_trade_floor(
+            order_floor=1_500.0,
+            portfolio_value=20_000.0,
+            side="BUY",
+            current_equity_weight=0.55,
+            target_equity_weight=0.80,
+            risk_rebalance_band=0.03,
+            risk_reduction_min_trade_weight=0.01,
+            risk_increase_min_trade_weight=0.01,
+        )
+        unchanged, inactive_mode = ashare_utils.apply_risk_alignment_trade_floor(
+            order_floor=1_500.0,
+            portfolio_value=20_000.0,
+            side="SELL",
+            current_equity_weight=0.57,
+            target_equity_weight=0.55,
+            risk_rebalance_band=0.03,
+            risk_reduction_min_trade_weight=0.01,
+            risk_increase_min_trade_weight=0.01,
+        )
+
+        self.assertEqual(sell_floor, 200.0)
+        self.assertEqual(sell_mode, "REDUCE")
+        self.assertEqual(buy_floor, 200.0)
+        self.assertEqual(buy_mode, "INCREASE")
+        self.assertEqual(unchanged, 1_500.0)
+        self.assertEqual(inactive_mode, "")
 
     def test_percentage_trade_floors_scale_with_portfolio_value(self):
         common = {
@@ -77,6 +171,127 @@ class TradingRulesTest(unittest.TestCase):
 
         self.assertAlmostEqual(entry_floor, 1_982.563485)
         self.assertAlmostEqual(adjust_floor, 11_328.9342)
+
+    def test_force_risk_alignment_bypasses_the_per_stock_no_trade_band(self):
+        features = pd.DataFrame(
+            [
+                {
+                    "code": "000001",
+                    "industry_1": "A",
+                    "score_v2": 1.0,
+                    "volatility_120": 0.20,
+                }
+            ]
+        )
+        args = SimpleNamespace(
+            target_count=1,
+            min_target_count=1,
+            buy_rank=1,
+            sell_rank=2,
+            max_stock_weight=1.0,
+            max_industry_weight=1.0,
+            enable_lot_aware_selection=False,
+            score_temperature=0.80,
+            min_stock_volatility=0.08,
+            inverse_vol_power=1.0,
+            rebalance_band_weight=1.0,
+        )
+        ordinary, _ = factor_rank_backtest_v2h.build_targets_v2(
+            features,
+            {"000001": 100},
+            {"000001": 0.80},
+            args,
+            target_equity_weight=0.55,
+        )
+        aligned, meta = factor_rank_backtest_v2h.build_targets_v2(
+            features,
+            {"000001": 100},
+            {"000001": 0.80},
+            args,
+            target_equity_weight=0.55,
+            force_risk_alignment=True,
+        )
+
+        self.assertAlmostEqual(ordinary["000001"], 0.80)
+        self.assertAlmostEqual(aligned["000001"], 0.55)
+        self.assertTrue(meta["force_risk_alignment"])
+
+    def test_risk_alignment_modes_preserve_the_best_banded_baseline(self):
+        best = factor_rank_backtest_v2h.parse_args(
+            [
+                "--strategy-config",
+                "config/v2h4_small_account_20k_best_20260723.json",
+            ]
+        )
+        candidate = factor_rank_backtest_v2h.parse_args(
+            [
+                "--strategy-config",
+                "config/v2h4_small_account_20k_sparse_weekly.json",
+            ]
+        )
+
+        self.assertEqual(best.risk_target_alignment, "banded")
+        self.assertEqual(best.risk_rebalance_schedule, "daily")
+        self.assertEqual(best.risk_alignment_max_orders, 0)
+        self.assertFalse(
+            factor_rank_backtest_v2h.should_force_risk_alignment(best, 0.80, 0.55)
+        )
+
+        self.assertEqual(candidate.risk_target_alignment, "strict")
+        self.assertEqual(candidate.risk_rebalance_schedule, "scheduled_only")
+        self.assertEqual(candidate.risk_alignment_max_orders, 4)
+        self.assertTrue(
+            factor_rank_backtest_v2h.should_force_risk_alignment(candidate, 0.80, 0.55)
+        )
+        self.assertFalse(
+            factor_rank_backtest_v2h.should_run_unscheduled_risk_rebalance(
+                candidate, 0.80, 0.55
+            )
+        )
+
+    def test_sparse_risk_alignment_keeps_the_fewest_large_orders_needed(self):
+        planned = [
+            {"code": "A", "risk_alignment_mode": "REDUCE", "gross_amount": 2_000.0},
+            {"code": "B", "risk_alignment_mode": "REDUCE", "gross_amount": 1_800.0},
+            {"code": "C", "risk_alignment_mode": "REDUCE", "gross_amount": 1_600.0},
+            {"code": "D", "risk_alignment_mode": "REDUCE", "gross_amount": 1_400.0},
+            {"code": "E", "risk_alignment_mode": "", "gross_amount": 3_000.0},
+        ]
+
+        selected = factor_rank_backtest_v2h.select_sparse_risk_alignment_orders(
+            planned,
+            current_equity_weight=0.80,
+            target_equity_weight=0.55,
+            portfolio_value=20_000.0,
+            max_orders=4,
+        )
+
+        self.assertEqual([item["code"] for item in selected], ["A", "B", "C"])
+        self.assertEqual(selected[0]["sparse_risk_orders_dropped"], 2)
+        self.assertEqual(selected[0]["risk_alignment_order_cap"], 4)
+
+    def test_sparse_risk_alignment_uses_a_separate_initial_deployment_cap(self):
+        planned = [
+            {
+                "code": str(index),
+                "transition_type": "ENTRY",
+                "risk_alignment_mode": "INCREASE",
+                "gross_amount": 1_000.0,
+            }
+            for index in range(12)
+        ]
+
+        selected = factor_rank_backtest_v2h.select_sparse_risk_alignment_orders(
+            planned,
+            current_equity_weight=0.0,
+            target_equity_weight=0.90,
+            portfolio_value=20_000.0,
+            max_orders=4,
+            initial_max_orders=12,
+        )
+
+        self.assertEqual(len(selected), 12)
+        self.assertTrue(all(item["sparse_risk_execution"] for item in selected))
 
     def test_portfolio_lot_rounding_uses_residual_cash_for_an_extra_lot(self):
         shares = ashare_utils.round_portfolio_target_shares(
@@ -193,26 +408,70 @@ class AccountIsolationTest(unittest.TestCase):
             path = Path(directory) / "account_state.json"
             weekly_rebalance_v2h.save_account_state(
                 path,
-                {"account_id": "account_56w", "peak_portfolio_value": 560_000.0},
+                {"account_id": "account_large", "peak_portfolio_value": 500_000.0},
             )
 
-            state = weekly_rebalance_v2h.load_account_state(path, "account_56w")
-            self.assertEqual(state["peak_portfolio_value"], 560_000.0)
+            state = weekly_rebalance_v2h.load_account_state(path, "account_large")
+            self.assertEqual(state["peak_portfolio_value"], 500_000.0)
             with self.assertRaisesRegex(ValueError, "Account state mismatch"):
-                weekly_rebalance_v2h.load_account_state(path, "account_1w")
+                weekly_rebalance_v2h.load_account_state(path, "account_small")
 
     def test_legacy_shared_state_without_account_id_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "account_state.json"
-            path.write_text('{"peak_portfolio_value": 560000}', encoding="utf-8")
+            path.write_text('{"peak_portfolio_value": 500000}', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "has no account_id"):
-                weekly_rebalance_v2h.load_account_state(path, "account_1w")
+                weekly_rebalance_v2h.load_account_state(path, "account_small")
 
     def test_default_state_paths_are_account_specific(self):
-        large = weekly_rebalance_v2h.default_account_state_path("account_56w")
-        small = weekly_rebalance_v2h.default_account_state_path("account_1w")
+        large = weekly_rebalance_v2h.default_account_state_path("account_large")
+        small = weekly_rebalance_v2h.default_account_state_path("account_small")
         self.assertNotEqual(large, small)
         self.assertEqual(large.name, "account_state.json")
+
+
+class WeeklyCapitalStrategyRoutingTest(unittest.TestCase):
+    def test_capital_boundaries_select_the_validated_strategy_tiers(self):
+        strategy_map = weekly_rebalance_v2h.load_capital_strategy_map(
+            Path("config/weekly_capital_strategy_map.json")
+        )
+        cases = [
+            (20_000.0, "small_sparse_12", "v2h4_small_account_20k_best_20260724_sparse_weekly.json"),
+            (49_999.99, "small_sparse_12", "v2h4_small_account_20k_best_20260724_sparse_weekly.json"),
+            (50_000.0, "core_20", "v2h4_strategy_10w_20stock_concentrated.json"),
+            (749_999.99, "core_20", "v2h4_strategy_10w_20stock_concentrated.json"),
+            (750_000.0, "capacity_25", "v2h4_strategy_10w_25stock_balanced.json"),
+            (10_000_000.0, "capacity_25", "v2h4_strategy_10w_25stock_balanced.json"),
+        ]
+        for value, expected_tier, expected_file in cases:
+            with self.subTest(value=value):
+                selected = weekly_rebalance_v2h.select_strategy_for_capital(
+                    value, strategy_map
+                )
+                self.assertEqual(selected["tier"], expected_tier)
+                self.assertEqual(Path(selected["strategy_config"]).name, expected_file)
+
+    def test_weekly_cli_defaults_to_automatic_selection_but_allows_manual_override(self):
+        automatic = weekly_rebalance_v2h.parse_args(
+            ["--account-id", "account_a", "--positions", "positions.csv"]
+        )
+        self.assertIsNone(automatic.strategy_config)
+        self.assertEqual(
+            automatic.capital_strategy_map,
+            Path("config/weekly_capital_strategy_map.json"),
+        )
+
+        manual = weekly_rebalance_v2h.parse_args(
+            [
+                "--account-id",
+                "account_a",
+                "--positions",
+                "positions.csv",
+                "--strategy-config",
+                "config/v2h4_strategy.json",
+            ]
+        )
+        self.assertEqual(manual.strategy_config, Path("config/v2h4_strategy.json"))
 
 
 class ForwardQuotationImportTest(unittest.TestCase):

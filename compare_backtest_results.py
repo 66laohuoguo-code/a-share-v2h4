@@ -38,11 +38,15 @@ SUMMARY_KEYS = [
     "min_trade_weight",
     "entry_exit_min_trade_value",
     "entry_exit_min_trade_weight",
+    "risk_reduction_min_trade_weight",
+    "risk_increase_min_trade_weight",
     "enable_lot_aware_selection",
     "lot_aware_min_holdings",
     "lot_aware_max_stock_weight",
     "lot_aware_max_industry_weight",
     "slippage_bps",
+    "broker_commission_rate",
+    "broker_minimum_commission",
 ]
 
 

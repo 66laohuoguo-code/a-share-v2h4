@@ -11,7 +11,8 @@ param(
     [switch]$ForceReimport,
     [string]$Positions = "",
     [string]$AccountState = "",
-    [string]$StrategyConfig = "config/v2h4_strategy.json",
+    [string]$StrategyConfig = "",
+    [string]$CapitalStrategyMap = "config/weekly_capital_strategy_map.json",
     [string]$OutputDir = "outputs/weekly_rebalance_v2h4"
 )
 
@@ -58,13 +59,20 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "Database maximum trading date: $MaxDate"
 
-& $Python weekly_rebalance_v2h.py `
-    --database $Database `
-    --account-id $AccountId `
-    --positions $Positions `
-    --account-state $AccountState `
-    --strategy-config $StrategyConfig `
-    --output-dir $AccountOutputDir
+$RebalanceArgs = @(
+    "weekly_rebalance_v2h.py",
+    "--database", $Database,
+    "--account-id", $AccountId,
+    "--positions", $Positions,
+    "--account-state", $AccountState,
+    "--capital-strategy-map", $CapitalStrategyMap,
+    "--output-dir", $AccountOutputDir
+)
+if (-not [string]::IsNullOrWhiteSpace($StrategyConfig)) {
+    $RebalanceArgs += @("--strategy-config", $StrategyConfig)
+}
+
+& $Python @RebalanceArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Weekly rebalance failed with exit code $LASTEXITCODE."
 }

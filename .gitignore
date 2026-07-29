@@ -4,6 +4,7 @@ venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.worktmp/
 
 # Secrets and machine-local configuration
 .env
@@ -13,6 +14,7 @@ config/portfolio_config.local.json
 config/*secret*
 config/*credential*
 MY_LOCAL_GUIDE.md
+AI_PROJECT_HANDOFF_LOCAL.md
 
 # Licensed/raw market data, account data, reports and generated factors
 data/*
@@ -70,9 +72,22 @@ inspect_resset_xlsx.py
 inspect_resset_xlsx_fast.py
 portfolio_rebalance.py
 run_v2_experiments.ps1
+scripts/
 
-# Only the two reproducible public strategy configurations are included
+# Only reproducible, non-secret public strategy configurations are included
 config/*
 !config/v2h4_strategy.json
 !config/v2h4_scaled_trades_candidate.json
 !config/v2h4_fixed_floor_legacy.json
+!config/v2h4_small_account_20k_balanced.json
+!config/v2h4_small_account_20k_concentrated.json
+!config/v2h4_small_account_20k_best_20260723.json
+!config/v2h4_small_account_20k_best_20260724_sparse_weekly.json
+!config/v2h4_small_account_20k_strict_full_rejected_20260724.json
+!config/v2h4_small_account_20k_sparse_weekly.json
+!config/v2h4_strategy_10w_weekly_causal.json
+!config/v2h4_strategy_10w_25stock_balanced.json
+!config/v2h4_strategy_10w_20stock_concentrated.json
+!config/v2h4_strategy_60stock_capacity.json
+!config/v2h4_strategy_80stock_capacity.json
+!config/weekly_capital_strategy_map.json

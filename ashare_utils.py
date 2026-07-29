@@ -214,13 +214,42 @@ def trade_value_floor(
     else:
         transition = "ADJUST"
 
-    if transition in {"ENTRY", "EXIT"} and entry_exit_min_trade_value is not None:
+    if transition == "EXIT":
+        return 0.0, transition
+    if transition == "ENTRY" and entry_exit_min_trade_value is not None:
         fixed_floor = max(0.0, float(entry_exit_min_trade_value))
         weight_floor = max(0.0, float(entry_exit_min_trade_weight))
     else:
         fixed_floor = max(0.0, float(min_trade_value))
         weight_floor = max(0.0, float(min_trade_weight))
     return max(fixed_floor, max(0.0, float(portfolio_value)) * weight_floor), transition
+
+
+def apply_risk_alignment_trade_floor(
+    order_floor,
+    portfolio_value,
+    side,
+    current_equity_weight,
+    target_equity_weight,
+    risk_rebalance_band,
+    risk_reduction_min_trade_weight,
+    risk_increase_min_trade_weight,
+):
+    """Lower order floors only when aggregate equity is outside its risk band."""
+    side = str(side or "").upper()
+    current = float(current_equity_weight)
+    target = float(target_equity_weight)
+    band = max(0.0, float(risk_rebalance_band))
+    if side == "SELL" and current > target + band:
+        mode = "REDUCE"
+        weight_floor = risk_reduction_min_trade_weight
+    elif side == "BUY" and current < target - band:
+        mode = "INCREASE"
+        weight_floor = risk_increase_min_trade_weight
+    else:
+        return max(0.0, float(order_floor)), ""
+    risk_floor = max(0.0, float(portfolio_value)) * max(0.0, float(weight_floor))
+    return min(max(0.0, float(order_floor)), risk_floor), mode
 
 
 def _schedule_rate(schedule, trade_date):
@@ -241,54 +270,105 @@ def _environment_float(name, default=0.0):
         raise ValueError(f"Environment variable {name} must be numeric, got: {value}") from exc
 
 
-def mandatory_trade_cost_components(side, trade_date=None, code=None):
+def mandatory_trade_cost_components(
+    side,
+    trade_date=None,
+    code=None,
+    broker_commission_rate=None,
+):
     side = str(side or "").upper()
     board = classify_a_share_board(code) if code else "SH_SZ"
     handling_key = (
         "bse_exchange_handling_fee_rate" if board == "BSE" else "sh_sz_exchange_handling_fee_rate"
     )
     schedule = MANDATORY_A_SHARE_TRADING_COST_SCHEDULE
+    configured_commission_rate = (
+        _environment_float(
+            "A_SHARE_BROKER_COMMISSION_RATE", schedule["broker_commission_rate"]
+        )
+        if broker_commission_rate is None
+        else max(0.0, float(broker_commission_rate))
+    )
     return {
         "stamp_tax": _schedule_rate(schedule["stamp_tax_sell_rate"], trade_date) if side == "SELL" else 0.0,
         "exchange_handling_fee": _schedule_rate(schedule[handling_key], trade_date),
         "securities_regulatory_fee": float(schedule["securities_regulatory_fee_rate"]),
         "transfer_fee": _schedule_rate(schedule["transfer_fee_rate"], trade_date),
-        "broker_commission": _environment_float(
-            "A_SHARE_BROKER_COMMISSION_RATE", schedule["broker_commission_rate"]
-        ),
+        "broker_commission": configured_commission_rate,
     }
 
 
-def mandatory_trade_cost_rate(side, trade_date=None, code=None):
-    return float(sum(mandatory_trade_cost_components(side, trade_date, code).values()))
+def mandatory_trade_cost_rate(
+    side,
+    trade_date=None,
+    code=None,
+    broker_commission_rate=None,
+):
+    return float(
+        sum(
+            mandatory_trade_cost_components(
+                side,
+                trade_date,
+                code,
+                broker_commission_rate,
+            ).values()
+        )
+    )
 
 
-def mandatory_trade_cost(amount, side, trade_date=None, code=None):
+def mandatory_trade_cost(
+    amount,
+    side,
+    trade_date=None,
+    code=None,
+    broker_commission_rate=None,
+    broker_minimum_commission=None,
+):
     gross = abs(float(amount or 0.0))
     if gross <= 0:
         return 0.0
-    components = mandatory_trade_cost_components(side, trade_date, code)
+    components = mandatory_trade_cost_components(
+        side,
+        trade_date,
+        code,
+        broker_commission_rate,
+    )
     commission_rate = float(components.pop("broker_commission", 0.0))
     statutory_cost = gross * float(sum(components.values()))
-    minimum_commission = _environment_float("A_SHARE_BROKER_MIN_COMMISSION", 0.0)
+    minimum_commission = (
+        _environment_float("A_SHARE_BROKER_MIN_COMMISSION", 0.0)
+        if broker_minimum_commission is None
+        else max(0.0, float(broker_minimum_commission))
+    )
     commission = max(gross * commission_rate, minimum_commission) if commission_rate > 0 else 0.0
     return statutory_cost + commission
 
 
-def trading_cost_snapshot(trade_date=None, code=None):
+def trading_cost_snapshot(
+    trade_date=None,
+    code=None,
+    broker_commission_rate=None,
+    broker_minimum_commission=None,
+):
     effective_date = str(trade_date or datetime.now().date().isoformat())[:10]
     snapshot = dict(MANDATORY_A_SHARE_TRADING_COSTS)
     snapshot.update(
         {
             "effective_date": effective_date,
             "board": classify_a_share_board(code) if code else "SH_SZ",
-            "broker_commission_rate": mandatory_trade_cost_components("BUY", effective_date, code)[
-                "broker_commission"
-            ],
-            "buy_total_rate": mandatory_trade_cost_rate("BUY", effective_date, code),
-            "sell_total_rate": mandatory_trade_cost_rate("SELL", effective_date, code),
-            "broker_minimum_commission_per_order": _environment_float(
-                "A_SHARE_BROKER_MIN_COMMISSION", 0.0
+            "broker_commission_rate": mandatory_trade_cost_components(
+                "BUY", effective_date, code, broker_commission_rate
+            )["broker_commission"],
+            "buy_total_rate": mandatory_trade_cost_rate(
+                "BUY", effective_date, code, broker_commission_rate
+            ),
+            "sell_total_rate": mandatory_trade_cost_rate(
+                "SELL", effective_date, code, broker_commission_rate
+            ),
+            "broker_minimum_commission_per_order": (
+                _environment_float("A_SHARE_BROKER_MIN_COMMISSION", 0.0)
+                if broker_minimum_commission is None
+                else max(0.0, float(broker_minimum_commission))
             ),
             "historical_schedule": MANDATORY_A_SHARE_TRADING_COST_SCHEDULE,
         }

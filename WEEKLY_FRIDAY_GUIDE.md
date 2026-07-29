@@ -42,24 +42,24 @@ YYYY_YYYYMMDD_N.xlsx
 每个券商账户必须有一个固定且互不重复的 `AccountId`。例如：
 
 ```text
-account_56w
-account_1w
+account_a
+account_b
 ```
 
 账户文件分别放在：
 
 ```text
-data/input/accounts/account_56w/positions.csv
-data/input/accounts/account_1w/positions.csv
+data/input/accounts/account_a/positions.csv
+data/input/accounts/account_b/positions.csv
 ```
 
 首次创建目录和模板：
 
 ```powershell
-New-Item -ItemType Directory -Force "data/input/accounts/account_56w"
-New-Item -ItemType Directory -Force "data/input/accounts/account_1w"
-Copy-Item "data/input/positions.example.csv" "data/input/accounts/account_56w/positions.csv"
-Copy-Item "data/input/positions.example.csv" "data/input/accounts/account_1w/positions.csv"
+New-Item -ItemType Directory -Force "data/input/accounts/account_a"
+New-Item -ItemType Directory -Force "data/input/accounts/account_b"
+Copy-Item "data/input/positions.example.csv" "data/input/accounts/account_a/positions.csv"
+Copy-Item "data/input/positions.example.csv" "data/input/accounts/account_b/positions.csv"
 ```
 
 然后根据对应券商账户修改各自的 `positions.csv`：
@@ -90,7 +90,7 @@ powershell.exe `
   -Python ".\.venv\Scripts\python.exe" `
   -Database ".\data\processed\stock_daily.sqlite" `
   -SourceDir ".\data\raw\market_data" `
-  -AccountId "account_56w" `
+  -AccountId "account_a" `
   -Year (Get-Date).Year
 ```
 
@@ -104,11 +104,11 @@ powershell.exe `
   -Python ".\.venv\Scripts\python.exe" `
   -Database ".\data\processed\stock_daily.sqlite" `
   -SourceDir ".\data\raw\market_data" `
-  -AccountId "account_1w" `
+  -AccountId "account_b" `
   -Year (Get-Date).Year
 ```
 
-默认情况下，`run_weekly.ps1` 会根据 `AccountId` 自动选择：
+默认情况下，`run_weekly.ps1` 会根据 `AccountId` 自动选择账户文件：
 
 ```text
 持仓：data/input/accounts/<AccountId>/positions.csv
@@ -118,13 +118,24 @@ powershell.exe `
 
 `account_state.json` 会保存该账户自己的历史峰值和最近净值。状态文件中的账户 ID 与本次参数不一致时，程序会直接报错，防止账户串用。
 
+程序还会按照最新收盘价计算当前账户总资产并自动选策略：
+
+| 当前账户总资产 | 自动策略 |
+|---:|---|
+| 低于 5 万元 | `v2h4_small_account_20k_best_20260724_sparse_weekly.json`（12只） |
+| 5 万元至低于 75 万元 | `v2h4_strategy_10w_20stock_concentrated.json`（20只） |
+| 75 万元及以上 | `v2h4_strategy_10w_25stock_balanced.json`（25只） |
+
+这里使用的是实际资产，不是根据 `account_a`、`account_b` 等名称猜测。资金分档配置保存在 `config/weekly_capital_strategy_map.json`。只有需要故意固定某个策略时才传入 `-StrategyConfig`；正常每周流程不要传。
+
 程序会自动：
 
 1. 用 `import_csmar_forward_quotation.py` 读取前推行情。
 2. 跳过已经成功导入且没有变化的 Excel。
 3. 以前一有效收盘价为锚点续接周度价格链。
 4. 校验数据库并显示最大交易日。
-5. 读取真实持仓，计算目标组合和订单。
+5. 读取真实持仓和现金，按当前总资产选择策略。
+6. 用本周最新数据重新计算因子排名、目标组合和订单。
 
 正式策略会跳过最小申报数量超出账户预算的候选，继续寻找下一只可买股票；小账户会减少持股数量，并在报告中显示实际持股数、动态单股上限和动态行业上限。
 
@@ -143,8 +154,8 @@ Database maximum trading date: YYYY-MM-DD
 打开对应账户目录中最新的 `.xlsx`，例如：
 
 ```text
-outputs/weekly_rebalance_v2h4/account_56w/
-outputs/weekly_rebalance_v2h4/account_1w/
+outputs/weekly_rebalance_v2h4/account_a/
+outputs/weekly_rebalance_v2h4/account_b/
 ```
 
 - `summary`：当前仓位、目标仓位、市场状态和警告。
@@ -152,6 +163,8 @@ outputs/weekly_rebalance_v2h4/account_1w/
 - `projected_positions`：假设全部成交后的预计持仓。
 
 `orders` 中 `reference_close` 是最近交易日的未复权市场收盘价。`indicative_price` 只是在收盘价上加入配置滑点并按 `0.01` 元取整的预算价格，不是下个交易日的保证成交价，也不是必须照抄的委托价格。下个交易日会因为集合竞价、盘口变化和价格优先/时间优先规则产生不同的实际成交价。
+
+正式 `config/v2h4_strategy.json` 当前按券商万分之三、每笔最低 5 元估算佣金。`estimated_fee` 已包含券商佣金和法定费用，并参与买入现金检查。更换券商或费率后必须同步修改配置中的 `broker_commission_rate` 和 `broker_minimum_commission`。
 
 开盘前重新检查停牌、ST、涨跌停、权限和现金。优先处理卖单，确认卖出资金后再处理买单。程序不会自动连接券商或自动下单。
 

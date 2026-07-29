@@ -21,6 +21,7 @@ import pandas as pd
 import factor_rank_backtest as base
 import factor_rank_backtest_v2h as v2h
 from ashare_utils import (
+    apply_risk_alignment_trade_floor,
     buy_order_size_rules,
     load_positions,
     mandatory_trade_cost,
@@ -36,6 +37,7 @@ from ashare_utils import (
 DEFAULT_DATABASE = Path("data/processed/stock_daily.sqlite")
 DEFAULT_ACCOUNTS_DIR = Path("data/input/accounts")
 DEFAULT_STRATEGY_CONFIG = Path("config/v2h4_strategy.json")
+DEFAULT_CAPITAL_STRATEGY_MAP = Path("config/weekly_capital_strategy_map.json")
 DEFAULT_OUTPUT_DIR = Path("outputs/weekly_rebalance_v2h4")
 ACCOUNT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
@@ -99,6 +101,90 @@ def load_account_state(path: Path, expected_account_id: str) -> Dict[str, object
 def save_account_state(path: Path, state: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(json_ready(dict(state)), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_capital_strategy_map(path: Path) -> Dict[str, object]:
+    path = Path(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Capital strategy map must be a JSON object: {path}")
+    raw_tiers = payload.get("tiers")
+    if not isinstance(raw_tiers, list) or not raw_tiers:
+        raise ValueError(f"Capital strategy map must contain a non-empty tiers list: {path}")
+
+    tiers = []
+    previous_limit = 0.0
+    for index, raw_tier in enumerate(raw_tiers):
+        if not isinstance(raw_tier, dict):
+            raise ValueError(f"Capital strategy tier {index + 1} must be a JSON object: {path}")
+        tier_name = str(raw_tier.get("tier", "")).strip()
+        config_value = str(raw_tier.get("strategy_config", "")).strip()
+        if not tier_name or not config_value:
+            raise ValueError(
+                f"Capital strategy tier {index + 1} needs tier and strategy_config: {path}"
+            )
+        maximum = raw_tier.get("max_value_exclusive")
+        if maximum is None:
+            if index != len(raw_tiers) - 1:
+                raise ValueError("Only the final capital strategy tier may have no upper limit.")
+            maximum_value = None
+        else:
+            maximum_value = safe_float(maximum, np.nan)
+            if not math.isfinite(maximum_value) or maximum_value <= previous_limit:
+                raise ValueError("Capital strategy tier limits must be finite and strictly increasing.")
+            previous_limit = float(maximum_value)
+
+        strategy_config = Path(config_value)
+        if not strategy_config.is_absolute():
+            strategy_config = path.parent / strategy_config
+        if not strategy_config.is_file():
+            raise FileNotFoundError(
+                f"Strategy config for capital tier {tier_name!r} was not found: {strategy_config}"
+            )
+        tiers.append(
+            {
+                "tier": tier_name,
+                "label": str(raw_tier.get("label", tier_name)),
+                "max_value_exclusive": maximum_value,
+                "strategy_config": strategy_config,
+            }
+        )
+    if tiers[-1]["max_value_exclusive"] is not None:
+        raise ValueError("The final capital strategy tier must have no upper limit.")
+
+    validated_minimum = safe_float(payload.get("validated_min_value"), np.nan)
+    validated_maximum = safe_float(payload.get("validated_max_value"), np.nan)
+    return {
+        "path": path,
+        "version": int(payload.get("version", 1)),
+        "selection_basis": str(
+            payload.get("selection_basis", "current_total_value_at_latest_close")
+        ),
+        "validated_min_value": (
+            float(validated_minimum) if math.isfinite(validated_minimum) else None
+        ),
+        "validated_max_value": (
+            float(validated_maximum) if math.isfinite(validated_maximum) else None
+        ),
+        "tiers": tiers,
+    }
+
+
+def select_strategy_for_capital(
+    total_value: float, capital_strategy_map: Mapping[str, object]
+) -> Dict[str, object]:
+    value = safe_float(total_value, np.nan)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("Current portfolio value must be positive before selecting a strategy.")
+    for tier in capital_strategy_map["tiers"]:
+        maximum = tier["max_value_exclusive"]
+        if maximum is None or value < float(maximum):
+            return dict(tier)
+    raise ValueError("Capital strategy map has no tier covering the current portfolio value.")
+
+
+def strategy_args_from_config(path: Path):
+    return v2h.parse_args(["--strategy-config", str(path)])
 
 
 def latest_as_of_date(conn, requested=None):
@@ -168,6 +254,21 @@ def limited_trade_shares(code, requested, side, liquidating=False):
     return int(minimum + math.floor((requested - minimum) / increment) * increment)
 
 
+def configured_trade_cost(gross, side, trade_date, code, strategy_args):
+    return mandatory_trade_cost(
+        gross,
+        side,
+        trade_date,
+        code,
+        broker_commission_rate=float(
+            getattr(strategy_args, "broker_commission_rate", 0.0)
+        ),
+        broker_minimum_commission=float(
+            getattr(strategy_args, "broker_minimum_commission", 0.0)
+        ),
+    )
+
+
 def build_order_plan(
     holdings,
     cash,
@@ -200,6 +301,12 @@ def build_order_plan(
             side,
         )
     target_shares_by_code = round_portfolio_target_shares(targets, total_value, target_prices)
+    current_equity_weight = (
+        max(0.0, float(total_value) - float(cash)) / float(total_value)
+        if float(total_value) > 0
+        else 0.0
+    )
+    target_equity_weight = float(sum(max(0.0, float(weight)) for weight in targets.values()))
 
     for code in sorted(set(holdings).union(targets)):
         row = prices.get(code)
@@ -225,6 +332,16 @@ def build_order_plan(
             getattr(strategy_args, "min_trade_weight", 0.0),
             getattr(strategy_args, "entry_exit_min_trade_value", None),
             getattr(strategy_args, "entry_exit_min_trade_weight", 0.0),
+        )
+        order_floor, risk_alignment_mode = apply_risk_alignment_trade_floor(
+            order_floor,
+            total_value,
+            side,
+            current_equity_weight,
+            target_equity_weight,
+            strategy_args.risk_rebalance_band,
+            getattr(strategy_args, "risk_reduction_min_trade_weight", 0.01),
+            getattr(strategy_args, "risk_increase_min_trade_weight", 0.01),
         )
         trade_shares = limited_trade_shares(
             code,
@@ -261,11 +378,16 @@ def build_order_plan(
                 "side": side,
                 "transition_type": transition_type,
                 "trade_value_floor": order_floor,
+                "risk_alignment_mode": risk_alignment_mode,
+                "risk_reduction_trade": risk_alignment_mode == "REDUCE",
+                "risk_increase_trade": risk_alignment_mode == "INCREASE",
                 "shares": int(trade_shares),
                 "reference_close": close,
                 "indicative_price": price,
                 "gross_amount": gross,
-                "estimated_fee": mandatory_trade_cost(gross, side, as_of_date, code),
+                "estimated_fee": configured_trade_cost(
+                    gross, side, as_of_date, code, strategy_args
+                ),
                 "current_shares": current_shares,
                 "target_shares_before_cash_check": target_shares,
                 "current_weight": current_shares * close / total_value if total_value > 0 else 0.0,
@@ -277,6 +399,22 @@ def build_order_plan(
             }
         )
 
+    original_planned_count = len(planned)
+    planned = v2h.select_sparse_risk_alignment_orders(
+        planned,
+        current_equity_weight,
+        target_equity_weight,
+        total_value,
+        getattr(strategy_args, "risk_alignment_max_orders", 0),
+        getattr(strategy_args, "risk_alignment_initial_max_orders", 0),
+    )
+    if len(planned) < original_planned_count:
+        warnings.append(
+            "Sparse risk execution kept "
+            f"{len(planned)} of {original_planned_count} executable orders; "
+            "remaining risk alignment will be reconsidered next week."
+        )
+
     executed = []
     projected_cash = float(cash)
     projected_holdings = {str(code): int(shares) for code, shares in holdings.items() if int(shares) > 0}
@@ -286,7 +424,7 @@ def build_order_plan(
         if shares <= 0:
             continue
         gross = shares * float(order["indicative_price"])
-        fee = mandatory_trade_cost(gross, "SELL", as_of_date, code)
+        fee = configured_trade_cost(gross, "SELL", as_of_date, code, strategy_args)
         projected_holdings[code] = int(projected_holdings.get(code, 0)) - shares
         if projected_holdings[code] <= 0:
             projected_holdings.pop(code, None)
@@ -306,7 +444,7 @@ def build_order_plan(
         shares = int(order["shares"])
         while shares >= minimum:
             gross = shares * float(order["indicative_price"])
-            fee = mandatory_trade_cost(gross, "BUY", as_of_date, code)
+            fee = configured_trade_cost(gross, "BUY", as_of_date, code, strategy_args)
             if gross + fee <= projected_cash + 1e-8:
                 break
             shares -= increment
@@ -316,7 +454,7 @@ def build_order_plan(
         gross = shares * float(order["indicative_price"])
         if gross < float(order["trade_value_floor"]):
             continue
-        fee = mandatory_trade_cost(gross, "BUY", as_of_date, code)
+        fee = configured_trade_cost(gross, "BUY", as_of_date, code, strategy_args)
         projected_cash -= gross + fee
         projected_holdings[code] = int(projected_holdings.get(code, 0)) + shares
         item = dict(order)
@@ -394,8 +532,20 @@ def run(args):
         if args.output_dir is not None
         else DEFAULT_OUTPUT_DIR / account_id
     )
-    strategy_argv = ["--strategy-config", str(args.strategy_config)]
-    strategy_args = v2h.parse_args(strategy_argv)
+    manual_strategy_config = (
+        Path(args.strategy_config) if args.strategy_config is not None else None
+    )
+    capital_strategy_map = None
+    if manual_strategy_config is not None:
+        candidate_strategy_configs = [manual_strategy_config]
+    else:
+        capital_strategy_map = load_capital_strategy_map(Path(args.capital_strategy_map))
+        candidate_strategy_configs = [
+            Path(tier["strategy_config"]) for tier in capital_strategy_map["tiers"]
+        ]
+    candidate_strategy_args = [
+        strategy_args_from_config(path) for path in candidate_strategy_configs
+    ]
     conn = sqlite3.connect(args.database)
     warnings = []
     try:
@@ -403,7 +553,16 @@ def run(args):
         dates = base.trading_dates(conn)
         date_to_index = {date: index for index, date in enumerate(dates)}
         as_of_index = date_to_index[as_of_date]
-        prehistory = max(int(strategy_args.feature_history_days), int(strategy_args.min_history_days) + 30, 320)
+        prehistory = max(
+            320,
+            *[
+                max(
+                    int(candidate.feature_history_days),
+                    int(candidate.min_history_days) + 30,
+                )
+                for candidate in candidate_strategy_args
+            ],
+        )
         history_start = dates[max(0, as_of_index - prehistory)]
         prices = base.load_prices(conn, history_start, as_of_date)
         prices["code"] = prices["code"].astype(str).str.zfill(6)
@@ -427,10 +586,6 @@ def run(args):
             .tail(1)
         )
         last_known_close = latest_rows.set_index("code")["close"].apply(safe_float).to_dict()
-        market_state = base.build_market_state(prices, strategy_args)
-        financial = base.load_financial_factors(conn)
-        industry_events = base.load_industry_event_scores(strategy_args.industry_event_scores)
-        event_regime = base.load_event_regime_signals(strategy_args.event_regime_signals)
 
         positions, positions_cash = load_positions(positions_path)
         cash = float(args.cash) if args.cash is not None else float(positions_cash)
@@ -448,6 +603,44 @@ def run(args):
             )
 
         account_state = load_account_state(account_state_path, account_id)
+        if manual_strategy_config is not None:
+            strategy_selection_mode = "manual_override"
+            capital_strategy_tier = "manual"
+            capital_strategy_label = "Manual strategy override"
+            strategy_config_path = manual_strategy_config
+        else:
+            selected_tier = select_strategy_for_capital(total_value, capital_strategy_map)
+            strategy_selection_mode = "automatic_by_current_total_value"
+            capital_strategy_tier = str(selected_tier["tier"])
+            capital_strategy_label = str(selected_tier["label"])
+            strategy_config_path = Path(selected_tier["strategy_config"])
+            validated_minimum = capital_strategy_map.get("validated_min_value")
+            validated_maximum = capital_strategy_map.get("validated_max_value")
+            if validated_minimum is not None and total_value < float(validated_minimum):
+                warnings.append(
+                    f"Current value CNY {total_value:,.2f} is below the validated capital range "
+                    f"starting at CNY {float(validated_minimum):,.2f}; the smallest-account "
+                    "strategy is used as an extrapolation."
+                )
+            if validated_maximum is not None and total_value > float(validated_maximum):
+                warnings.append(
+                    f"Current value CNY {total_value:,.2f} is above the validated capital range "
+                    f"ending at CNY {float(validated_maximum):,.2f}; review liquidity and "
+                    "participation constraints before trading."
+                )
+            previous_tier = str(account_state.get("last_capital_strategy_tier", "")).strip()
+            if previous_tier and previous_tier != capital_strategy_tier:
+                warnings.append(
+                    f"Automatic strategy tier changed from {previous_tier!r} to "
+                    f"{capital_strategy_tier!r} because the current account value crossed "
+                    "a configured capital boundary."
+                )
+
+        strategy_args = strategy_args_from_config(strategy_config_path)
+        market_state = base.build_market_state(prices, strategy_args)
+        financial = base.load_financial_factors(conn)
+        industry_events = base.load_industry_event_scores(strategy_args.industry_event_scores)
+        event_regime = base.load_event_regime_signals(strategy_args.event_regime_signals)
         stored_peak = safe_float(account_state.get("peak_portfolio_value"), np.nan)
         requested_peak = safe_float(args.peak_value, np.nan)
         peak_value = requested_peak if math.isfinite(requested_peak) and requested_peak > 0 else stored_peak
@@ -478,6 +671,11 @@ def run(args):
             strategy_args,
             float(regime["target_equity_weight"]),
             total_value,
+            force_risk_alignment=v2h.should_force_risk_alignment(
+                strategy_args,
+                sum(current_weights.values()),
+                float(regime["target_equity_weight"]),
+            ),
         )
         orders, projected_positions, projected_cash, order_warnings = build_order_plan(
             holdings,
@@ -511,6 +709,15 @@ def run(args):
         summary = {
             "account_id": account_id,
             "strategy": str(getattr(strategy_args, "strategy_name", "V2H4")),
+            "strategy_config": str(strategy_config_path),
+            "strategy_selection_mode": strategy_selection_mode,
+            "capital_strategy_tier": capital_strategy_tier,
+            "capital_strategy_label": capital_strategy_label,
+            "capital_strategy_map": (
+                None
+                if capital_strategy_map is None
+                else str(capital_strategy_map["path"])
+            ),
             "as_of_date": as_of_date,
             "database": str(args.database),
             "positions_file": str(positions_path),
@@ -520,6 +727,12 @@ def run(args):
             "current_total_value": total_value,
             "execution_price_source": "unadjusted close reconstructed from market value / shares",
             "indicative_price_slippage_bps": float(strategy_args.slippage_bps),
+            "broker_commission_rate": float(
+                getattr(strategy_args, "broker_commission_rate", 0.0)
+            ),
+            "broker_minimum_commission": float(
+                getattr(strategy_args, "broker_minimum_commission", 0.0)
+            ),
             "peak_portfolio_value": peak_value,
             "portfolio_drawdown": float(regime["portfolio_drawdown"]),
             "market_state": str(regime["market_state"]),
@@ -540,7 +753,26 @@ def run(args):
             "entry_exit_min_trade_weight": float(
                 getattr(strategy_args, "entry_exit_min_trade_weight", 0.0)
             ),
+            "risk_reduction_min_trade_weight": float(
+                getattr(strategy_args, "risk_reduction_min_trade_weight", 0.01)
+            ),
+            "risk_increase_min_trade_weight": float(
+                getattr(strategy_args, "risk_increase_min_trade_weight", 0.01)
+            ),
             "lot_aware_selection": bool(target_meta.get("lot_aware", False)),
+            "force_risk_alignment": bool(target_meta.get("force_risk_alignment", False)),
+            "risk_target_alignment": str(
+                getattr(strategy_args, "risk_target_alignment", "banded")
+            ),
+            "risk_rebalance_schedule": str(
+                getattr(strategy_args, "risk_rebalance_schedule", "daily")
+            ),
+            "risk_alignment_max_orders": int(
+                getattr(strategy_args, "risk_alignment_max_orders", 0)
+            ),
+            "risk_alignment_initial_max_orders": int(
+                getattr(strategy_args, "risk_alignment_initial_max_orders", 0)
+            ),
             "affordable_target_count": int(
                 target_meta.get("affordable_count", target_meta.get("selected_count", 0))
             ),
@@ -560,7 +792,15 @@ def run(args):
             "projected_total_value_at_close": projected_total_value,
             "projected_equity_weight": projected_equity_weight,
             "factor_weights": v2h.STATIC_COMPONENT_WEIGHTS,
-            "trading_costs": trading_cost_snapshot(as_of_date),
+            "trading_costs": trading_cost_snapshot(
+                as_of_date,
+                broker_commission_rate=float(
+                    getattr(strategy_args, "broker_commission_rate", 0.0)
+                ),
+                broker_minimum_commission=float(
+                    getattr(strategy_args, "broker_minimum_commission", 0.0)
+                ),
+            ),
             "warnings": warnings,
         }
 
@@ -615,6 +855,10 @@ def run(args):
                     "peak_portfolio_value": peak_value,
                     "last_portfolio_value": total_value,
                     "last_as_of_date": as_of_date,
+                    "last_strategy": str(getattr(strategy_args, "strategy_name", "V2H4")),
+                    "last_strategy_config": str(strategy_config_path),
+                    "last_strategy_selection_mode": strategy_selection_mode,
+                    "last_capital_strategy_tier": capital_strategy_tier,
                     "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 },
             )
@@ -622,6 +866,9 @@ def run(args):
         print(f"Account: {account_id}")
         print(f"As-of date: {as_of_date}")
         print(f"Current value: {total_value:.2f}")
+        print(f"Strategy selection: {strategy_selection_mode}")
+        print(f"Capital tier: {capital_strategy_tier}")
+        print(f"Strategy config: {strategy_config_path}")
         print(f"Target equity: {float(regime['target_equity_weight']):.2%}")
         print(f"Orders: {len(orders)}")
         print(f"Workbook: {paths['workbook']}")
@@ -636,7 +883,17 @@ def parse_args(argv=None):
     parser.add_argument("--account-id", required=True, help="Stable ID used to isolate one brokerage account.")
     parser.add_argument("--positions", type=Path, required=True)
     parser.add_argument("--account-state", type=Path)
-    parser.add_argument("--strategy-config", type=Path, default=DEFAULT_STRATEGY_CONFIG)
+    parser.add_argument(
+        "--strategy-config",
+        type=Path,
+        help="Manual strategy override. Omit to select from the current total account value.",
+    )
+    parser.add_argument(
+        "--capital-strategy-map",
+        type=Path,
+        default=DEFAULT_CAPITAL_STRATEGY_MAP,
+        help="Capital-tier strategy map used when --strategy-config is omitted.",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--as-of-date")
     parser.add_argument("--cash", type=float, help="Override CASH from the positions file for this run.")
