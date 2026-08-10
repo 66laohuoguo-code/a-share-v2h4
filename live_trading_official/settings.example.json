@@ -1,0 +1,20 @@
+{
+  "ProjectRoot": "C:\\path\\to\\ashare-project",
+  "Python": "C:\\path\\to\\python.exe",
+  "MarketDatabase": "C:\\path\\to\\stock_daily_live.sqlite",
+  "RiskDatabase": "D:\\path\\to\\weekly_risk_model.sqlite",
+  "SourceDir": "C:\\path\\to\\weekly_market_files",
+  "RiskDataRawRoot": "C:\\path\\to\\risk_model_raw_data",
+  "RiskModelConfig": "C:\\path\\to\\ashare-project\\config\\risk_model_v31_full_2019_20260717.json",
+  "CapitalStrategyMap": "C:\\path\\to\\ashare-project\\config\\weekly_capital_strategy_map.json",
+  "RiskCalibrationSchedule": "",
+  "OutputDir": "C:\\path\\to\\ashare-project\\outputs\\weekly_rebalance",
+  "ForwardCutoffDate": "2026-07-17",
+  "RiskModelWorkers": 4,
+  "Year": 2026,
+  "Accounts": [
+    "account_small",
+    "account_medium",
+    "account_large"
+  ]
+}

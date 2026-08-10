@@ -276,6 +276,41 @@ def unadjusted_close_from_row(raw, columns, code=None):
     return round(sum(candidates) / len(candidates), 2)
 
 
+def market_value_from_row(raw, columns, header):
+    if header not in columns:
+        return None
+    index = columns[header]
+    value = parse_float(raw[index] if index < len(raw) else None)
+    return value if value is not None and value > 0 else None
+
+
+def a_share_market_values_from_row(raw, columns, code=None):
+    total_market_value = market_value_from_row(raw, columns, "MarketValue")
+    security_class = "B" if code and code.startswith(("200", "900")) else "A"
+    class_header = f"{security_class}Value"
+    float_market_value = market_value_from_row(raw, columns, class_header)
+    if float_market_value is None:
+        float_market_value = market_value_from_row(
+            raw, columns, "CirculatedMarketValue"
+        )
+    return total_market_value, float_market_value
+
+
+def turnover_percent(volume, price, market_value, fallback_decimal=None):
+    if (
+        volume is not None
+        and volume >= 0
+        and price is not None
+        and price > 0
+        and market_value is not None
+        and market_value > 0
+    ):
+        return volume * price * 100.0 / market_value
+    if fallback_decimal is not None and fallback_decimal >= 0:
+        return fallback_decimal * 100.0
+    return None
+
+
 def latest_database_meta_before(conn, source_start_date):
     columns = {row[1] for row in conn.execute("PRAGMA table_info(stock_daily)")}
     raw_close_sql = "d.raw_close" if "raw_close" in columns else "NULL"
@@ -673,6 +708,15 @@ def process_file(conn, path, args):
             turnover = parse_float(raw[turnover_idx] if turnover_idx < len(raw) else None)
             volume = parse_float(raw[volume_idx] if volume_idx < len(raw) else None)
             amount = parse_float(raw[amount_idx] if amount_idx < len(raw) else None)
+            total_market_value, float_market_value = a_share_market_values_from_row(
+                raw, columns, code=code
+            )
+            turnover_total = turnover_percent(
+                volume, market_close, total_market_value, turnover
+            )
+            turnover_float = turnover_percent(
+                volume, market_close, float_market_value, turnover
+            )
 
             meta = existing[code]
             record = {
@@ -693,8 +737,8 @@ def process_file(conn, path, args):
                 "adj_close_2": synthetic_close,
                 "volume": volume,
                 "amount": amount,
-                "turnover_total": turnover,
-                "turnover_float": turnover,
+                "turnover_total": turnover_total,
+                "turnover_float": turnover_float,
                 "adj_factor": scale,
                 "daily_return": change_ratio,
                 "capital_return": change_ratio,

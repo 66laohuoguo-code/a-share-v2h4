@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pandas as pd
 import ashare_utils
 import build_csmar_database
+import build_weekly_risk_model
 import database_status
 import factor_rank_backtest
 import factor_rank_backtest_v2h
@@ -25,6 +26,26 @@ class TradingRulesTest(unittest.TestCase):
             ashare_utils.mandatory_trade_cost_rate("SELL", "2024-01-05", "000001"),
             0.0005641,
         )
+
+    def test_2010_costs_use_exchange_specific_historical_rates(self):
+        shanghai = ashare_utils.mandatory_trade_cost(
+            10_000.0,
+            "BUY",
+            "2010-01-05",
+            "600000",
+            broker_commission_rate=0.0,
+            shares=1_000,
+        )
+        shenzhen = ashare_utils.mandatory_trade_cost(
+            10_000.0,
+            "BUY",
+            "2010-01-05",
+            "000001",
+            broker_commission_rate=0.0,
+            shares=1_000,
+        )
+        self.assertAlmostEqual(shanghai, 2.0)
+        self.assertAlmostEqual(shenzhen, 1.875)
 
     def test_broker_commission_rate_and_minimum_are_applied_per_order(self):
         buy_small = ashare_utils.mandatory_trade_cost(
@@ -92,6 +113,94 @@ class TradingRulesTest(unittest.TestCase):
 
     def test_new_bse_codes_use_the_thirty_percent_price_limit(self):
         self.assertEqual(factor_rank_backtest.price_limit_rate("920001"), 0.30)
+
+    def test_historical_chinext_and_st_price_limits(self):
+        self.assertEqual(
+            factor_rank_backtest.price_limit_rate("300001", "2019-01-04"),
+            0.10,
+        )
+        self.assertEqual(
+            factor_rank_backtest.price_limit_rate("300001", "2021-01-04"),
+            0.20,
+        )
+        self.assertEqual(
+            factor_rank_backtest.price_limit_rate(
+                "600000", "2019-01-04", "ST"
+            ),
+            0.05,
+        )
+
+    def test_actual_csmar_limit_prices_override_code_fallback(self):
+        args = SimpleNamespace(
+            disable_limit_trade_filter=False,
+            limit_trade_buffer=0.0,
+        )
+        row = {
+            "trade_date": "2019-01-04",
+            "prev_close": 10.0,
+            "open": 11.5,
+            "limit_up": 12.0,
+            "limit_down": 8.0,
+            "listed_state": "Norm",
+        }
+        self.assertFalse(
+            factor_rank_backtest.blocked_by_price_limit(
+                "300001", row, "BUY", args
+            )
+        )
+        row["open"] = 12.0
+        self.assertTrue(
+            factor_rank_backtest.blocked_by_price_limit(
+                "300001", row, "BUY", args
+            )
+        )
+
+    def test_csmar_no_limit_day_is_not_filtered(self):
+        args = SimpleNamespace(
+            disable_limit_trade_filter=False,
+            limit_trade_buffer=0.0,
+        )
+        row = {
+            "trade_date": "2019-01-04",
+            "prev_close": 10.0,
+            "open": 20.0,
+            "listed_state": "Norm",
+            "no_price_limit": 1,
+        }
+        self.assertFalse(
+            factor_rank_backtest.blocked_by_price_limit(
+                "600000", row, "BUY", args
+            )
+        )
+
+    def test_risk_model_industry_schedule_is_sorted_and_causal(self):
+        schedule = build_weekly_risk_model.industry_classification_schedule(
+            {
+                "industry_classification_schedule": [
+                    {
+                        "classification_name": "new",
+                        "effective_date": "2012-10-26",
+                    },
+                    {
+                        "classification_name": "old",
+                        "effective_date": "1900-01-01",
+                    },
+                ]
+            }
+        )
+        self.assertEqual(
+            schedule,
+            [
+                {
+                    "classification_name": "old",
+                    "effective_date": "1900-01-01",
+                },
+                {
+                    "classification_name": "new",
+                    "effective_date": "2012-10-26",
+                },
+            ],
+        )
 
     def test_entry_exit_trade_floors_are_separate_from_adjustments(self):
         common = {
@@ -293,6 +402,110 @@ class TradingRulesTest(unittest.TestCase):
         self.assertEqual(len(selected), 12)
         self.assertTrue(all(item["sparse_risk_execution"] for item in selected))
 
+    def test_replacement_guard_defers_unfunded_sells_near_the_target_equity(self):
+        planned = [
+            {"code": "A", "side": "SELL", "gross_amount": 3_000.0},
+            {"code": "B", "side": "SELL", "gross_amount": 2_000.0},
+        ]
+
+        selected, diagnostics = (
+            factor_rank_backtest_v2h.balance_executable_replacement_orders(
+                planned,
+                current_equity_weight=0.5529,
+                target_equity_weight=0.55,
+                portfolio_value=100_000.0,
+            )
+        )
+
+        self.assertEqual(selected, [])
+        self.assertEqual(diagnostics["deferred_replacement_sell_count"], 2)
+        self.assertAlmostEqual(diagnostics["desired_net_buy_gross"], -290.0)
+
+    def test_replacement_guard_keeps_balanced_switch_orders(self):
+        planned = [
+            {"code": "BUY", "side": "BUY", "gross_amount": 3_000.0},
+            {"code": "SELL1", "side": "SELL", "gross_amount": 1_000.0},
+            {"code": "SELL2", "side": "SELL", "gross_amount": 2_000.0},
+        ]
+
+        selected, diagnostics = (
+            factor_rank_backtest_v2h.balance_executable_replacement_orders(
+                planned,
+                current_equity_weight=0.55,
+                target_equity_weight=0.55,
+                portfolio_value=100_000.0,
+            )
+        )
+
+        self.assertEqual({item["code"] for item in selected}, {"BUY", "SELL1", "SELL2"})
+        self.assertFalse(diagnostics["replacement_guard_applied"])
+
+    def test_replacement_guard_allows_required_net_risk_reduction(self):
+        planned = [
+            {"code": "A", "side": "SELL", "gross_amount": 10_000.0},
+            {"code": "B", "side": "SELL", "gross_amount": 15_000.0},
+            {"code": "C", "side": "SELL", "gross_amount": 5_000.0},
+        ]
+
+        selected, diagnostics = (
+            factor_rank_backtest_v2h.balance_executable_replacement_orders(
+                planned,
+                current_equity_weight=0.80,
+                target_equity_weight=0.55,
+                portfolio_value=100_000.0,
+            )
+        )
+
+        self.assertAlmostEqual(
+            sum(item["gross_amount"] for item in selected), 25_000.0
+        )
+        self.assertEqual(diagnostics["deferred_replacement_sell_count"], 1)
+
+    def test_replacement_guard_accepts_a_lot_overshoot_when_it_is_closer(self):
+        planned = [
+            {"code": "A", "side": "SELL", "gross_amount": 1_588.0},
+        ]
+
+        selected, diagnostics = (
+            factor_rank_backtest_v2h.balance_executable_replacement_orders(
+                planned,
+                current_equity_weight=0.5445,
+                target_equity_weight=0.4797,
+                portfolio_value=20_121.88,
+            )
+        )
+
+        self.assertEqual([item["code"] for item in selected], ["A"])
+        self.assertEqual(diagnostics["deferred_replacement_sell_count"], 0)
+
+    def test_unmarketable_buy_does_not_fund_a_replacement_sell(self):
+        planned = [
+            {
+                "code": "BUY",
+                "side": "BUY",
+                "gross_amount": 3_000.0,
+                "auction_marketable": False,
+            },
+            {
+                "code": "SELL",
+                "side": "SELL",
+                "gross_amount": 3_000.0,
+                "auction_marketable": True,
+            },
+        ]
+
+        selected, diagnostics = (
+            factor_rank_backtest_v2h.balance_executable_replacement_orders(
+                planned,
+                current_equity_weight=0.55,
+                target_equity_weight=0.55,
+                portfolio_value=100_000.0,
+            )
+        )
+
+        self.assertEqual([item["code"] for item in selected], ["BUY"])
+        self.assertEqual(diagnostics["deferred_replacement_sell_count"], 1)
+
     def test_portfolio_lot_rounding_uses_residual_cash_for_an_extra_lot(self):
         shares = ashare_utils.round_portfolio_target_shares(
             {"000001": 0.035, "000002": 0.035},
@@ -436,12 +649,15 @@ class WeeklyCapitalStrategyRoutingTest(unittest.TestCase):
             Path("config/weekly_capital_strategy_map.json")
         )
         cases = [
-            (20_000.0, "small_sparse_12", "v2h4_small_account_20k_best_20260724_sparse_weekly.json"),
-            (49_999.99, "small_sparse_12", "v2h4_small_account_20k_best_20260724_sparse_weekly.json"),
-            (50_000.0, "core_20", "v2h4_strategy_10w_20stock_concentrated.json"),
-            (749_999.99, "core_20", "v2h4_strategy_10w_20stock_concentrated.json"),
-            (750_000.0, "capacity_25", "v2h4_strategy_10w_25stock_balanced.json"),
-            (10_000_000.0, "capacity_25", "v2h4_strategy_10w_25stock_balanced.json"),
+            (20_000.0, "v22s_20k_entry_weight", "v22s_20k_entry_weight_monthly_06_official.json"),
+            (49_999.99, "v22s_20k_entry_weight", "v22s_20k_entry_weight_monthly_06_official.json"),
+            (50_000.0, "v22r3_100k", "v22r3_weekly_100k_official.json"),
+            (299_999.99, "v22r3_100k", "v22r3_weekly_100k_official.json"),
+            (300_000.0, "v22r3_560k", "v22r3_weekly_560k_official.json"),
+            (749_999.99, "v22r3_560k", "v22r3_weekly_560k_official.json"),
+            (750_000.0, "v22r3_1m", "v22r3_weekly_1m_official.json"),
+            (1_000_000.0, "v22r3_1m", "v22r3_weekly_1m_official.json"),
+            (10_000_000.0, "v22r3_1m", "v22r3_weekly_1m_official.json"),
         ]
         for value, expected_tier, expected_file in cases:
             with self.subTest(value=value):
@@ -450,6 +666,64 @@ class WeeklyCapitalStrategyRoutingTest(unittest.TestCase):
                 )
                 self.assertEqual(selected["tier"], expected_tier)
                 self.assertEqual(Path(selected["strategy_config"]).name, expected_file)
+
+    def test_deployed_20k_strategy_uses_the_frozen_monthly_industry_signal(self):
+        strategy = weekly_rebalance_v2h.strategy_args_from_config(
+            Path("config/v22s_20k_entry_weight_monthly_06_official.json")
+        )
+        self.assertFalse(factor_rank_backtest_v2h.uses_v31_alpha_features(strategy))
+        self.assertEqual(strategy.v22_industry_satellite_application, "entry_and_weight")
+        self.assertEqual(strategy.v22_industry_satellite_schedule, "monthly")
+        self.assertAlmostEqual(strategy.v22_industry_satellite_max_weight, 0.06)
+        self.assertEqual(strategy.risk_overlay_mode, "variance_blend")
+
+    def test_monthly_satellite_signal_date_matches_first_week_end_of_month(self):
+        dates = [
+            "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05",
+            "2024-01-08", "2024-01-09", "2024-01-10", "2024-01-11", "2024-01-12",
+            "2024-01-15", "2024-01-16", "2024-01-17", "2024-01-18", "2024-01-19",
+            "2024-01-22", "2024-01-23", "2024-01-24", "2024-01-25", "2024-01-26",
+            "2024-01-29", "2024-01-30", "2024-01-31", "2024-02-01", "2024-02-02",
+        ]
+        date_to_index = {date: index for index, date in enumerate(dates)}
+        self.assertEqual(
+            weekly_rebalance_v2h.live_monthly_satellite_signal_date(
+                dates, date_to_index, "2024-01-26"
+            ),
+            "2024-01-05",
+        )
+        self.assertEqual(
+            weekly_rebalance_v2h.live_monthly_satellite_signal_date(
+                dates, date_to_index, "2024-02-02"
+            ),
+            "2024-02-02",
+        )
+        self.assertEqual(
+            weekly_rebalance_v2h.live_monthly_satellite_signal_date(
+                dates, date_to_index, "2024-01-03"
+            ),
+            "2024-01-03",
+        )
+
+    def test_deployed_v22r3_configs_require_weekly_v31_alpha_data(self):
+        for name in (
+            "v22r3_weekly_100k_official.json",
+            "v22r3_weekly_560k_official.json",
+            "v22r3_weekly_1m_official.json",
+        ):
+            with self.subTest(config=name):
+                strategy = weekly_rebalance_v2h.strategy_args_from_config(
+                    Path("config") / name
+                )
+                self.assertTrue(
+                    factor_rank_backtest_v2h.uses_v31_alpha_features(strategy)
+                )
+                self.assertAlmostEqual(strategy.v31_alpha_tilt_weight, 0.10)
+                self.assertTrue(strategy.v31_enforce_unknown_industry_cap)
+                self.assertEqual(
+                    weekly_rebalance_v2h.required_v31_live_columns(strategy),
+                    ("v31_earnings_yield_raw", "v31_quality_raw"),
+                )
 
     def test_weekly_cli_defaults_to_automatic_selection_but_allows_manual_override(self):
         automatic = weekly_rebalance_v2h.parse_args(
@@ -473,8 +747,67 @@ class WeeklyCapitalStrategyRoutingTest(unittest.TestCase):
         )
         self.assertEqual(manual.strategy_config, Path("config/v2h4_strategy.json"))
 
+        risk = weekly_rebalance_v2h.parse_args(
+            [
+                "--account-id",
+                "account_a",
+                "--positions",
+                "positions.csv",
+                "--risk-model-database",
+                "risk.sqlite",
+                "--risk-calibration-schedule",
+                "calibration.csv",
+            ]
+        )
+        self.assertEqual(risk.risk_model_database, Path("risk.sqlite"))
+        self.assertEqual(
+            risk.risk_calibration_schedule,
+            Path("calibration.csv"),
+        )
+
+        reset = weekly_rebalance_v2h.parse_args(
+            [
+                "--account-id",
+                "account_a",
+                "--positions",
+                "positions.csv",
+                "--reset-peak-to-current",
+            ]
+        )
+        self.assertTrue(reset.reset_peak_to_current)
+
 
 class ForwardQuotationImportTest(unittest.TestCase):
+    def test_forward_turnover_is_stored_in_the_historical_percent_unit(self):
+        total = import_csmar_forward_quotation.turnover_percent(
+            volume=114_093_292.0,
+            price=11.10,
+            market_value=215_388_000_000.0,
+            fallback_decimal=0.00588,
+        )
+        fallback = import_csmar_forward_quotation.turnover_percent(
+            volume=None,
+            price=11.10,
+            market_value=None,
+            fallback_decimal=0.00588,
+        )
+        self.assertAlmostEqual(total, 0.588, places=3)
+        self.assertAlmostEqual(fallback, 0.588)
+
+    def test_forward_market_values_prefer_a_share_float_value(self):
+        columns = {
+            "MarketValue": 0,
+            "CirculatedMarketValue": 1,
+            "AValue": 2,
+        }
+        total, floating = (
+            import_csmar_forward_quotation.a_share_market_values_from_row(
+                [1000.0, 800.0, 700.0], columns, code="000001"
+            )
+        )
+        self.assertEqual(total, 1000.0)
+        self.assertEqual(floating, 700.0)
+
     def test_market_value_per_share_reconstructs_unadjusted_close(self):
         columns = {
             "MarketValue": 0,
@@ -675,6 +1008,36 @@ class FullCsmarBuildTest(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM stock_meta").fetchone()[0], 1)
         self.assertEqual(conn.execute("SELECT raw_close FROM latest_prices").fetchone()[0], 10.0)
         conn.close()
+
+    def test_partial_build_bootstraps_completed_daily_files(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            build_csmar_database.create_schema(conn)
+            record = {
+                column: None for column in build_csmar_database.STOCK_DAILY_COLUMNS
+            }
+            record.update(
+                {
+                    "code": "000001",
+                    "trade_date": "2012-01-04",
+                    "close": 10.0,
+                    "daily_return": 0.0,
+                    "capital_return": 0.0,
+                    "no_price_limit": 0,
+                    "source_file": "daily\\part1.xlsx",
+                    "imported_at": "2026-08-03T00:00:00+08:00",
+                }
+            )
+            build_csmar_database.insert_daily_batch(conn, [record])
+            conn.commit()
+            build_csmar_database.ensure_resume_schema(conn)
+            state = conn.execute(
+                "SELECT status, written_rows FROM csmar_daily_import_state "
+                "WHERE source_file='daily\\part1.xlsx'"
+            ).fetchone()
+            self.assertEqual(state, ("complete", 1))
+        finally:
+            conn.close()
 
     def test_daily_record_maps_raw_prices_returns_and_turnover(self):
         headers = [

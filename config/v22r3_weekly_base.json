@@ -1,0 +1,11 @@
+{
+  "extends": "v2h4_strategy_10w_20stock_auction975_official.json",
+  "strategy_name": "V2.2_R3_weekly_base",
+  "v31_alpha_tilt_weight": 0.10,
+  "v31_industry_cap_deviation": 0.04,
+  "v31_absolute_industry_cap": 0.25,
+  "v31_unknown_industry_cap": 0.05,
+  "v31_enforce_unknown_industry_cap": true,
+  "residual_momentum_lookback_weeks": 52,
+  "residual_momentum_skip_weeks": 4
+}

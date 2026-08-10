@@ -1,26 +1,32 @@
 {
-  "version": 1,
+  "version": 4,
   "selection_basis": "current_total_value_at_latest_close",
   "validated_min_value": 20000.0,
-  "validated_max_value": 10000000.0,
+  "validated_max_value": 1000000.0,
   "tiers": [
     {
-      "tier": "small_sparse_12",
-      "label": "Below CNY 50,000: 12-stock sparse weekly strategy",
+      "tier": "v22s_20k_entry_weight",
+      "label": "Below CNY 50,000: validated 20k V2.2S monthly industry-entry-and-weight strategy with risk overlay and Q90 auction limits",
       "max_value_exclusive": 50000.0,
-      "strategy_config": "v2h4_small_account_20k_best_20260724_sparse_weekly.json"
+      "strategy_config": "v22s_20k_entry_weight_monthly_06_official.json"
     },
     {
-      "tier": "core_20",
-      "label": "CNY 50,000 to below CNY 750,000: 20-stock strategy",
+      "tier": "v22r3_100k",
+      "label": "CNY 50,000 to below CNY 300,000: strict-continuous V2.2 R3 strategy validated at CNY 100,000",
+      "max_value_exclusive": 300000.0,
+      "strategy_config": "v22r3_weekly_100k_official.json"
+    },
+    {
+      "tier": "v22r3_560k",
+      "label": "CNY 300,000 to below CNY 750,000: strict-continuous V2.2 R3 strategy validated at CNY 560,000",
       "max_value_exclusive": 750000.0,
-      "strategy_config": "v2h4_strategy_10w_20stock_concentrated.json"
+      "strategy_config": "v22r3_weekly_560k_official.json"
     },
     {
-      "tier": "capacity_25",
-      "label": "CNY 750,000 and above: 25-stock strategy",
+      "tier": "v22r3_1m",
+      "label": "CNY 750,000 and above: strict-continuous V2.2 R3 strategy validated at CNY 1,000,000",
       "max_value_exclusive": null,
-      "strategy_config": "v2h4_strategy_10w_25stock_balanced.json"
+      "strategy_config": "v22r3_weekly_1m_official.json"
     }
   ]
 }

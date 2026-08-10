@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 from collections import Counter
 from datetime import datetime, timezone
 import json
@@ -70,6 +71,10 @@ STOCK_DAILY_COLUMNS = (
     "daily_return",
     "capital_return",
     "risk_free_return",
+    "limit_down",
+    "limit_up",
+    "limit_status",
+    "no_price_limit",
     "listed_state",
     "currency",
     "industry_1",
@@ -78,6 +83,18 @@ STOCK_DAILY_COLUMNS = (
     "source_sheet",
     "imported_at",
 )
+
+FILE_ALIASES = {
+    "company": ("TRD_Co.xlsx", "股票基本信息.xlsx"),
+    "adjust_factor": ("TRD_AdjustFactor.xlsx", "股票复权因子.xlsx"),
+    "no_limit": ("TRD_NoLimit.xlsx", "无涨跌停限制.xlsx"),
+    "industry": ("STK_INDUSTRYCLASS.xlsx", "上市公司行业分类.xlsx"),
+}
+
+CSRC_2001_CLASSIFICATION = "证监会行业分类2001年版"
+CSRC_2012_CLASSIFICATION = "证监会行业分类2012年版"
+CSRC_2012_EFFECTIVE_DATE = "2012-10-26"
+ASSOCIATION_CLASSIFICATION = "中国上市公司协会上市公司行业分类"
 
 
 def now_iso():
@@ -130,6 +147,96 @@ def read_one_sheet(path):
         raise ValueError(f"Expected one worksheet in {path}; found {len(sheets)}")
     sheet_name, sheet_path = sheets[0]
     return zf, sheet_name, iter_sheet_rows(zf, sheet_path, shared)
+
+
+def find_alias_files(root, aliases):
+    matches = []
+    for filename in aliases:
+        matches.extend(root.rglob(filename))
+    return sorted(set(matches), key=natural_key)
+
+
+class CausalIndustryHistory:
+    def __init__(self, rows):
+        grouped = {}
+        for code, classification_name, implement_date, industry_code, industry_name in rows:
+            key = (code, classification_name)
+            grouped.setdefault(key, []).append(
+                (implement_date, industry_code, industry_name)
+            )
+        self.history = {}
+        for key, values in grouped.items():
+            values.sort(key=lambda item: item[0])
+            self.history[key] = ([item[0] for item in values], values)
+
+    def get(self, code, trade_date):
+        classification = (
+            CSRC_2001_CLASSIFICATION
+            if trade_date < CSRC_2012_EFFECTIVE_DATE
+            else CSRC_2012_CLASSIFICATION
+        )
+        # The association classification is a dated fallback for newly listed
+        # stocks not yet covered by the selected CSRC release. It shares the
+        # leading national-economic-industry letter used by the broad model.
+        for candidate in (classification, ASSOCIATION_CLASSIFICATION):
+            dates_and_values = self.history.get((code, candidate))
+            if not dates_and_values:
+                continue
+            dates, values = dates_and_values
+            index = bisect_right(dates, trade_date) - 1
+            if index < 0:
+                continue
+            implement_date, industry_code, industry_name = values[index]
+            return {
+                "implement_date": implement_date,
+                "industry_code": industry_code,
+                "industry_name": industry_name,
+                "classification_name": candidate,
+            }
+        return None
+
+
+def load_industry_history(path):
+    records = []
+    zf, _, rows = read_one_sheet(path)
+    try:
+        columns = header_map(next(rows, None) or [])
+        required = {
+            "Symbol", "IndustryClassificationName", "ImplementDate",
+            "IndustryCode", "IndustryName",
+        }
+        missing = sorted(required - set(columns))
+        if missing:
+            raise ValueError(f"Missing industry-history headers in {path.name}: {missing}")
+        for row in rows:
+            code = parse_code(row_value(row, columns, "Symbol"))
+            classification_name = clean_text(
+                row_value(row, columns, "IndustryClassificationName")
+            )
+            implement_date = parse_date(row_value(row, columns, "ImplementDate"))
+            industry_code = clean_text(row_value(row, columns, "IndustryCode"))
+            if (
+                code
+                and classification_name in {
+                    CSRC_2001_CLASSIFICATION,
+                    CSRC_2012_CLASSIFICATION,
+                    ASSOCIATION_CLASSIFICATION,
+                }
+                and implement_date
+                and industry_code
+            ):
+                records.append(
+                    (
+                        code,
+                        classification_name,
+                        implement_date,
+                        industry_code,
+                        clean_text(row_value(row, columns, "IndustryName")),
+                    )
+                )
+    finally:
+        zf.close()
+    return CausalIndustryHistory(records), len(records)
 
 
 def load_legacy_metadata(path):
@@ -233,6 +340,10 @@ def create_schema(conn):
             daily_return REAL,
             capital_return REAL,
             risk_free_return REAL,
+            limit_down REAL,
+            limit_up REAL,
+            limit_status INTEGER,
+            no_price_limit INTEGER NOT NULL DEFAULT 0,
             listed_state TEXT,
             currency TEXT,
             industry_1 TEXT,
@@ -288,8 +399,68 @@ def create_schema(conn):
             key TEXT PRIMARY KEY,
             value TEXT
         ) WITHOUT ROWID;
+
+        CREATE TABLE csmar_daily_import_state (
+            source_file TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            written_rows INTEGER NOT NULL DEFAULT 0,
+            completed_at TEXT
+        ) WITHOUT ROWID;
         """
     )
+
+
+def ensure_resume_schema(conn):
+    required_tables = {"stock_daily", "csmar_company", "csmar_no_limit"}
+    existing_tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    missing = sorted(required_tables - existing_tables)
+    if missing:
+        raise ValueError(
+            f"Partial database cannot be resumed; missing tables: {missing}"
+        )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS csmar_daily_import_state (
+            source_file TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            written_rows INTEGER NOT NULL DEFAULT 0,
+            completed_at TEXT
+        ) WITHOUT ROWID
+        """
+    )
+    completed_at = now_iso()
+    for source_file, written_rows in conn.execute(
+        """
+        SELECT source_file, COUNT(*)
+        FROM stock_daily
+        WHERE source_file IS NOT NULL
+        GROUP BY source_file
+        """
+    ).fetchall():
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO csmar_daily_import_state
+            VALUES (?, 'complete', ?, ?)
+            """,
+            (source_file, int(written_rows), completed_at),
+        )
+    conn.commit()
+
+
+def mark_daily_file_complete(conn, source_file, written_rows):
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO csmar_daily_import_state
+        VALUES (?, 'complete', ?, ?)
+        """,
+        (str(source_file), int(written_rows), now_iso()),
+    )
+    conn.commit()
 
 
 def insert_company_rows(conn, companies):
@@ -381,7 +552,17 @@ def turnover_rate(volume, close, market_value_thousand):
     return volume * 100.0 / shares if shares > 0 else None
 
 
-def daily_record(row, columns, source_file, source_sheet, source_root, imported_at, metadata):
+def daily_record(
+    row,
+    columns,
+    source_file,
+    source_sheet,
+    source_root,
+    imported_at,
+    metadata,
+    industry_history=None,
+    no_limit_keys=None,
+):
     code = parse_code(row_value(row, columns, "Stkcd"))
     trade_date = parse_date(row_value(row, columns, "Trddt"))
     market_type = parse_int(row_value(row, columns, "Markettype"))
@@ -408,6 +589,18 @@ def daily_record(row, columns, source_file, source_sheet, source_root, imported_
     adj_close_2 = positive(row_value(row, columns, "Adjprcnd"))
     trading_state = parse_int(row_value(row, columns, "Trdsta"))
     info = metadata.get(code, {})
+    point_in_time_industry = (
+        industry_history.get(code, trade_date) if industry_history is not None else None
+    )
+    if point_in_time_industry:
+        industry_1 = point_in_time_industry["industry_code"][:1]
+        industry_2 = point_in_time_industry["industry_code"]
+    elif industry_history is None:
+        industry_1 = info.get("industry_1") or "UNKNOWN"
+        industry_2 = info.get("industry_2") or industry_1
+    else:
+        industry_1 = "UNKNOWN"
+        industry_2 = "UNKNOWN"
 
     change_ratio = parse_float(row_value(row, columns, "ChangeRatio"))
     if prev_close and change_ratio is not None:
@@ -440,10 +633,16 @@ def daily_record(row, columns, source_file, source_sheet, source_root, imported_
         "daily_return": daily_return,
         "capital_return": capital_return,
         "risk_free_return": None,
+        "limit_down": positive(row_value(row, columns, "LimitDown")),
+        "limit_up": positive(row_value(row, columns, "LimitUp")),
+        "limit_status": parse_int(row_value(row, columns, "LimitStatus")),
+        "no_price_limit": int(
+            no_limit_keys is not None and (code, trade_date) in no_limit_keys
+        ),
         "listed_state": "ST" if trading_state in SPECIAL_TREATMENT_STATES else "Norm",
         "currency": "CNY",
-        "industry_1": info.get("industry_1") or "UNKNOWN",
-        "industry_2": info.get("industry_2") or info.get("industry_1") or "UNKNOWN",
+        "industry_1": industry_1,
+        "industry_2": industry_2,
         "source_file": str(source_file.relative_to(source_root)),
         "source_sheet": source_sheet,
         "imported_at": imported_at,
@@ -467,6 +666,8 @@ def import_daily_file(
     end_date,
     metadata,
     batch_size,
+    industry_history=None,
+    no_limit_keys=None,
 ):
     started = time.monotonic()
     counters = Counter()
@@ -493,6 +694,8 @@ def import_daily_file(
                 source_root,
                 imported_at,
                 metadata,
+                industry_history,
+                no_limit_keys,
             )
             if record is None:
                 counters[str(diagnostic)] += 1
@@ -527,6 +730,7 @@ def import_daily_file(
     elapsed = time.monotonic() - started
     return {
         **counters,
+        "written_rows": int(counters.get("written_rows", 0)),
         "min_date": min_date,
         "max_date": max_date,
         "trading_dates": len(dates),
@@ -666,17 +870,25 @@ def validate_database(conn, expected_start, expected_end):
     return report
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--database", type=Path, required=True)
+    parser.add_argument(
+        "--industry-file",
+        type=Path,
+        help=(
+            "Explicit full-history STK_INDUSTRYCLASS workbook. When supplied, "
+            "it replaces the industry workbook discovered below --source-dir."
+        ),
+    )
     parser.add_argument("--legacy-database", type=Path)
     parser.add_argument("--start-date", default="2019-01-01")
     parser.add_argument("--end-date", default="2026-07-17")
     parser.add_argument("--batch-size", type=int, default=20_000)
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--report", type=Path)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def run(args):
@@ -691,25 +903,40 @@ def run(args):
     build_path = database.with_suffix(database.suffix + ".building")
 
     daily_files = sorted(source_dir.rglob("TRD_Dalyr*.xlsx"), key=natural_key)
-    company_files = list(source_dir.rglob("TRD_Co.xlsx"))
-    adjust_files = list(source_dir.rglob("TRD_AdjustFactor.xlsx"))
-    no_limit_files = list(source_dir.rglob("TRD_NoLimit.xlsx"))
-    if not daily_files or len(company_files) != 1 or len(adjust_files) != 1 or len(no_limit_files) != 1:
+    company_files = find_alias_files(source_dir, FILE_ALIASES["company"])
+    adjust_files = find_alias_files(source_dir, FILE_ALIASES["adjust_factor"])
+    no_limit_files = find_alias_files(source_dir, FILE_ALIASES["no_limit"])
+    if args.industry_file is not None:
+        industry_path = args.industry_file.resolve()
+        if not industry_path.is_file():
+            raise FileNotFoundError(
+                f"Explicit industry-history workbook does not exist: {industry_path}"
+            )
+        industry_files = [industry_path]
+    else:
+        industry_files = find_alias_files(source_dir, FILE_ALIASES["industry"])
+    if (
+        not daily_files
+        or len(company_files) != 1
+        or len(adjust_files) != 1
+        or len(no_limit_files) != 1
+        or len(industry_files) != 1
+    ):
         raise ValueError(
-            "Expected daily files plus exactly one company, adjustment-factor and no-limit workbook."
+            "Expected daily files plus exactly one company, adjustment-factor, "
+            "no-limit and industry-history workbook."
         )
     if database.exists() and not args.reset:
         raise FileExistsError(f"Target database already exists: {database}")
-    if build_path.exists():
-        if args.reset:
-            build_path.unlink()
-        else:
-            raise FileExistsError(f"Partial build already exists: {build_path}")
+    if build_path.exists() and args.reset:
+        build_path.unlink()
+    resume_partial_build = build_path.exists()
 
     database.parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     legacy = load_legacy_metadata(legacy_database)
     companies = load_company_file(company_files[0], legacy)
+    industry_history, industry_history_rows = load_industry_history(industry_files[0])
     metadata = dict(legacy)
     for code, company in companies.items():
         current = metadata.setdefault(code, {})
@@ -727,6 +954,8 @@ def run(args):
     print(f"  daily files: {len(daily_files)}", flush=True)
     print(f"  legacy industry mappings: {len(legacy):,}", flush=True)
     print(f"  CSMAR company rows: {len(companies):,}", flush=True)
+    print(f"  causal CSRC industry rows: {industry_history_rows:,}", flush=True)
+    print(f"  resume partial build: {resume_partial_build}", flush=True)
 
     build_started = time.monotonic()
     conn = sqlite3.connect(build_path)
@@ -735,24 +964,71 @@ def run(args):
         "database": str(database),
         "start_date": args.start_date,
         "end_date": args.end_date,
-        "industry_source": str(company_files[0]),
+        "industry_source": str(industry_files[0]),
+        "industry_policy": (
+            f"{CSRC_2001_CLASSIFICATION} before {CSRC_2012_EFFECTIVE_DATE}; "
+            f"{CSRC_2012_CLASSIFICATION} from {CSRC_2012_EFFECTIVE_DATE}; "
+            f"dated fallback={ASSOCIATION_CLASSIFICATION}"
+        ),
         "daily_files": [],
     }
     try:
-        create_schema(conn)
-        insert_company_rows(conn, companies)
-        adjust_counts = import_adjust_factors(
-            conn, adjust_files[0], args.start_date, args.end_date
-        )
-        no_limit_counts = import_no_limit(
-            conn, no_limit_files[0], args.start_date, args.end_date
+        if resume_partial_build:
+            ensure_resume_schema(conn)
+            adjust_counts = {
+                "written_rows": conn.execute(
+                    "SELECT COUNT(*) FROM csmar_adjust_factor"
+                ).fetchone()[0]
+            }
+            no_limit_counts = {
+                "written_rows": conn.execute(
+                    "SELECT COUNT(*) FROM csmar_no_limit"
+                ).fetchone()[0]
+            }
+            print("  continuing the existing partial database", flush=True)
+        else:
+            create_schema(conn)
+            insert_company_rows(conn, companies)
+            adjust_counts = import_adjust_factors(
+                conn, adjust_files[0], args.start_date, args.end_date
+            )
+            no_limit_counts = import_no_limit(
+                conn, no_limit_files[0], args.start_date, args.end_date
+            )
+        no_limit_keys = set(
+            conn.execute("SELECT code, trade_date FROM csmar_no_limit").fetchall()
         )
         print(f"  adjustment factors: {adjust_counts['written_rows']:,}", flush=True)
         print(f"  no-limit rows: {no_limit_counts['written_rows']:,}", flush=True)
 
-        total_written = 0
+        total_written = int(
+            conn.execute("SELECT COUNT(*) FROM stock_daily").fetchone()[0]
+        )
         for index, path in enumerate(daily_files, start=1):
-            print(f"[{index}/{len(daily_files)}] {path.relative_to(source_dir)}", flush=True)
+            relative_path = str(path.relative_to(source_dir))
+            completed = conn.execute(
+                """
+                SELECT written_rows
+                FROM csmar_daily_import_state
+                WHERE source_file=? AND status='complete'
+                """,
+                (relative_path,),
+            ).fetchone()
+            if completed is not None:
+                print(
+                    f"[{index}/{len(daily_files)}] [skip complete] {relative_path} "
+                    f"({int(completed[0]):,} rows)",
+                    flush=True,
+                )
+                build_report["daily_files"].append(
+                    {
+                        "file": relative_path,
+                        "written_rows": int(completed[0]),
+                        "resumed_skip": True,
+                    }
+                )
+                continue
+            print(f"[{index}/{len(daily_files)}] {relative_path}", flush=True)
             file_report = import_daily_file(
                 conn,
                 path,
@@ -761,9 +1037,13 @@ def run(args):
                 args.end_date,
                 metadata,
                 args.batch_size,
+                industry_history,
+                no_limit_keys,
             )
-            total_written += int(file_report["written_rows"])
-            file_report["file"] = str(path.relative_to(source_dir))
+            written_rows = int(file_report.get("written_rows", 0))
+            total_written += written_rows
+            mark_daily_file_complete(conn, relative_path, written_rows)
+            file_report["file"] = relative_path
             build_report["daily_files"].append(file_report)
             print(
                 f"    done {file_report['written_rows']:,} rows, "
@@ -786,7 +1066,7 @@ def run(args):
         )
         conn.execute(
             "INSERT OR REPLACE INTO project_metadata VALUES (?,?)",
-            ("industry_source", str(company_files[0])),
+            ("industry_source", str(industry_files[0])),
         )
         conn.commit()
     finally:

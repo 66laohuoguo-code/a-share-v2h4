@@ -1,0 +1,9 @@
+{
+  "extends": "v2h4_small_account_20k_risk_overlay_auction90_official.json",
+  "strategy_name": "V2.2S_20k_06_entry_weight_monthly_06",
+  "v22_industry_satellite_max_weight": 0.06,
+  "v22_industry_satellite_top_industries": 1,
+  "v22_industry_satellite_schedule": "monthly",
+  "v22_industry_satellite_risk_throttle": "continuous_equity",
+  "v22_industry_satellite_application": "entry_and_weight"
+}

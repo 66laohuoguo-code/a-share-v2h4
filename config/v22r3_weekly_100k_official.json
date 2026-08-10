@@ -1,0 +1,4 @@
+{
+  "extends": "v22r3_weekly_base.json",
+  "strategy_name": "V2.2_R3_weekly_100k_official"
+}

@@ -45,6 +45,8 @@ flowchart LR
 ├── compare_backtest_results.py     # 多组回测对比表
 ├── capital_scale_analysis.py       # 不同资金规模的费用、容量与稳健排名
 ├── run_weekly.ps1                  # 每周导入、检查、调仓
+├── update_live_risk_model.ps1      # 实盘风险模型与V3.1 Alpha增量更新
+├── live_trading_official/          # 正式实盘操作中心与一键入口
 ├── run_v2h4_validation.ps1         # 基准、候选、压力测试
 ├── run_20k_commission_validation.ps1 # 2 万元账户的费用与小资金候选对比
 ├── run_capital_scale_validation.ps1 # 2 万至 1000 万元的策略规模扫描
@@ -53,6 +55,10 @@ flowchart LR
 ├── tests/                          # 核心规则单元测试
 └── WEEKLY_FRIDAY_GUIDE.md          # 每周操作说明
 ```
+
+本机或部署环境中的日常实盘操作，优先从
+`live_trading_official/` 进入。该目录集中提供单账户、全部账户、只更新行情与
+风险模型、状态检查等入口；底层模块仍保留在项目根目录作为唯一源码。
 
 原始行情、数据库、真实持仓、财报、回测输出和个人配置均由 `.gitignore` 排除。
 
@@ -248,6 +254,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -Python .\.venv\Scripts\python.exe `
   -Database data\processed\stock_daily.sqlite `
   -SourceDir data\raw\market_data `
+  -RiskDatabase data\processed\weekly_risk_model.sqlite `
+  -RiskCalibrationSchedule data\processed\weekly_risk_calibration_schedule.csv `
   -AccountId account_a `
   -Year (Get-Date).Year
 
@@ -256,6 +264,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -Python .\.venv\Scripts\python.exe `
   -Database data\processed\stock_daily.sqlite `
   -SourceDir data\raw\market_data `
+  -RiskDatabase data\processed\weekly_risk_model.sqlite `
+  -RiskCalibrationSchedule data\processed\weekly_risk_calibration_schedule.csv `
   -AccountId account_b `
   -Year (Get-Date).Year
 ```
@@ -264,11 +274,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 | 当前账户总资产 | 自动策略 |
 |---:|---|
-| 低于 5 万元 | 12 只稀疏周频版 |
-| 5 万元至低于 75 万元 | 20 只集中版 |
-| 75 万元及以上 | 25 只均衡版 |
+| 低于 5 万元 | 2万元验证版：V2.2S月度行业入场与权重卫星、12只、风险叠加、Q90集合竞价 |
+| 5 万元至低于 30 万元 | 10万元严格连续验证版：V2.2 R3、20只、价值质量倾斜、UNKNOWN行业5%上限、Q97.5集合竞价 |
+| 30 万元至低于 75 万元 | 56万元严格连续验证版：V2.2 R3、20只、价值质量倾斜、UNKNOWN行业5%上限、Q97.5集合竞价 |
+| 75 万元及以上 | 100万元严格连续验证版：V2.2 R3、20只、价值质量倾斜、UNKNOWN行业5%上限、Q97.5集合竞价 |
 
-回测验证范围是 2 万至 1000 万元。超出范围时程序仍会选择最接近的一档，但会在 `warnings` 中提示容量外推。确需固定某个配置时，仍可传入 `-StrategyConfig <配置路径>`，它会覆盖自动选择。
+当前自动部署版本的验证点是V2.2S的2万元策略，以及V2.2 R3的10万元、56万元和100万元。高于100万元时程序仍使用100万元档，但会在 `warnings` 中提示容量外推。确需固定某个配置时，仍可传入 `-StrategyConfig <配置路径>`，它会覆盖自动选择。
+
+所有自动档都必须传入 `-RiskDatabase`。2万元档使用其中的风险叠加快照和月度冻结行业趋势信号；V2.2 R3资金档使用其中的时点化盈利收益率和质量Alpha。需要的数据距离决策日最多允许14个自然日；缺少或过期时周调仓会停止，不会悄悄删除财务Alpha。`-RiskCalibrationSchedule` 只影响启用风险叠加的策略，可省略，此时使用配置中的固定校准倍率。
+
+`run_weekly.ps1` 默认会在生成订单前，把风险侧库中的市值、周频风险快照和V3.1 Alpha缓存增量更新到行情库最大日期。模型结束日期只是滚动计算边界，不再造成整套历史检查点失效。若旧侧库曾把某个周行情文件标记为已导入却缺少对应市值行，流程会只重导小型周文件，不会重读大型历史市值文件。`-SkipRiskModelUpdate` 仅供已经独立完成并核对更新的高级用法，正常实盘流程不要传入。
+
+2万元账户已经自动切换到 `config/v22s_20k_entry_weight_monthly_06_official.json`。它保留小账户整手与佣金约束、风险叠加和Q90竞价，并以每月第一个周末决策日冻结的行业 20/60 日相对趋势，调整新股票入场优先级与目标权重。详情见 [ACCOUNT_STRATEGY_TIERS.md](ACCOUNT_STRATEGY_TIERS.md)。
 
 `run_weekly.ps1` 会自动读取 `data/input/accounts/<账户ID>/positions.csv`，把状态写入同一账户目录，并把结果写入 `outputs/weekly_rebalance_v2h4/<账户ID>/`。状态文件中的账户 ID 不匹配时，程序会拒绝运行。控制台、`summary` 和 `account_state.json` 都会记录本次选择的资金档位和策略配置。
 
@@ -276,14 +293,23 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 
 - `summary`：风险状态、目标仓位、费用和警告；
 - `orders`：建议买卖方向、股数和参考价格；
+- `filtered_orders`：因交易金额门槛等原因未进入正式订单的候选及原因；
 - `projected_positions`：假设全部成交后的预计持仓；
 - `factor_ranking`：股票池及六项因子排名。
 
-`orders.reference_close` 是决策日未复权市场收盘价；`indicative_price` 是在该收盘价上加入配置滑点、并按 `0.01` 元价位取整后的资金预算价。它不是下一交易日的保证成交价，也不要求把它原样作为限价委托。
+`summary.target_equity_weight` 是行情状态给出的基础仓位，`summary.effective_target_equity_weight` 是经过风险覆盖层和组合目标变换后的最终有效目标。判断账户是否偏离目标时，应比较 `current_equity_weight`、`projected_equity_weight` 与 `effective_target_equity_weight`。
+
+周调仓带有换仓仓位保护：如果旧股票可以卖出，但替代买单因交易门槛、整手、现金或集合竞价可成交性而不可执行，程序会延期对应卖单，避免换股失败意外形成大额空仓。模型明确要求降低总仓位时，净卖出仍会正常执行。
+
+`orders.reference_close` 是决策日未复权市场收盘价。正式竞价策略把价格拆开显示：`indicative_price`/`estimated_execution_price` 是历史开盘缺口的中位预测；`broker_order_limit_price`/`auction_limit_price` 是集合竞价保护边界，买入表示最高接受价、卖出表示最低接受价；`cash_reservation_price` 用于整手和现金预算。保护边界不是预测成交价。
+
+集合竞价限价单若成交，按交易所形成的单一开盘价成交，而不是必然按保护边界成交。建议在 `09:15-09:20` 可撤单阶段观察虚拟开盘参考价后提交；开盘集合竞价后仍未成交的剩余委托应撤销，不要让激进限价继续进入连续竞价。
 
 具体周末流程见 [WEEKLY_FRIDAY_GUIDE.md](WEEKLY_FRIDAY_GUIDE.md)。
 
 ## 策略概要
+
+当前5万元及以上资金档部署V2.2 R3：在原V2H4排名上保留90%核心分数，加10%时点化盈利收益率/质量Alpha，并将无法识别行业的合计目标权重限制在5%。三个已验证资金档均使用20只股票和Q97.5集合竞价执行模型。
 
 V2H4 静态因子权重：
 

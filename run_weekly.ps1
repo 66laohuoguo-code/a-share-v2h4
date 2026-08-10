@@ -13,6 +13,14 @@ param(
     [string]$AccountState = "",
     [string]$StrategyConfig = "",
     [string]$CapitalStrategyMap = "config/weekly_capital_strategy_map.json",
+    [string]$RiskDatabase = $env:ASHARE_RISK_DATABASE,
+    [string]$RiskCalibrationSchedule = $env:ASHARE_RISK_CALIBRATION_SCHEDULE,
+    [string]$RiskModelConfig = "config/risk_model_v31_full_2019_20260717.json",
+    [string]$RiskDataRawRoot = "data/raw/CSMAR raw data",
+    [ValidateRange(1, 32)]
+    [int]$RiskModelWorkers = 4,
+    [switch]$SkipRiskModelUpdate,
+    [switch]$ResetPeakToCurrent,
     [string]$OutputDir = "outputs/weekly_rebalance_v2h4"
 )
 
@@ -59,6 +67,21 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "Database maximum trading date: $MaxDate"
 
+if (
+    -not [string]::IsNullOrWhiteSpace($RiskDatabase) -and
+    -not $SkipRiskModelUpdate
+) {
+    & (Join-Path $PSScriptRoot "update_live_risk_model.ps1") `
+        -Python $Python `
+        -MarketDatabase $Database `
+        -RiskDatabase $RiskDatabase `
+        -SourceDir $SourceDir `
+        -RiskModelConfig $RiskModelConfig `
+        -RiskDataRawRoot $RiskDataRawRoot `
+        -TargetDate $MaxDate `
+        -Workers $RiskModelWorkers
+}
+
 $RebalanceArgs = @(
     "weekly_rebalance_v2h.py",
     "--database", $Database,
@@ -70,6 +93,15 @@ $RebalanceArgs = @(
 )
 if (-not [string]::IsNullOrWhiteSpace($StrategyConfig)) {
     $RebalanceArgs += @("--strategy-config", $StrategyConfig)
+}
+if (-not [string]::IsNullOrWhiteSpace($RiskDatabase)) {
+    $RebalanceArgs += @("--risk-model-database", $RiskDatabase)
+}
+if (-not [string]::IsNullOrWhiteSpace($RiskCalibrationSchedule)) {
+    $RebalanceArgs += @("--risk-calibration-schedule", $RiskCalibrationSchedule)
+}
+if ($ResetPeakToCurrent) {
+    $RebalanceArgs += "--reset-peak-to-current"
 }
 
 & $Python @RebalanceArgs

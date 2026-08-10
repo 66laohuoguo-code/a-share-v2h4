@@ -37,6 +37,10 @@ MANDATORY_A_SHARE_TRADING_COSTS = {
     "transfer_fee_rate": 0.00001,
     "broker_commission_rate": 0.0,
     "sources": [
+        "MOF 2008 sell-side stamp-tax notice, https://www.mof.gov.cn/zhengwuxinxi/caizhengxinwen/200809/t20080919_76432.htm",
+        "SSE 2012 A-share handling-fee reductions, https://www.sse.com.cn/aboutus/mediacenter/hotandd/c/c_20150912_3988543.shtml",
+        "SSE 2012 regulatory-fee adjustment, https://www.sse.com.cn/lawandrules/guide/other/c/c_20230116_5312163.shtml",
+        "SSE/SZSE/CSDC 2015 handling and transfer-fee adjustment, https://www.sse.com.cn/aboutus/mediacenter/hotandd/c/c_20150912_3988866.shtml",
         "MOF/SAT Announcement No.39 of 2023: securities transaction stamp tax halved from 2023-08-28, https://www.mof.gov.cn/jrttts/202308/t20230828_3904235.htm",
         "SZSE fee table: A-share handling fee 0.0341 per mille both sides, https://www.szse.cn/marketServices/deal/payFees/",
         "CSRC 2023 handling-fee adjustment, https://www.csrc.gov.cn/csrc/c100028/c7426794/content.shtml",
@@ -49,8 +53,18 @@ MANDATORY_A_SHARE_TRADING_COST_SCHEDULE = {
         {"start_date": "1900-01-01", "end_date": "2023-08-27", "rate": 0.001},
         {"start_date": "2023-08-28", "end_date": None, "rate": 0.0005},
     ],
-    "sh_sz_exchange_handling_fee_rate": [
-        {"start_date": "1900-01-01", "end_date": "2023-08-27", "rate": 0.0000487},
+    "sh_exchange_handling_fee_rate": [
+        {"start_date": "1900-01-01", "end_date": "2012-05-31", "rate": 0.0001100},
+        {"start_date": "2012-06-01", "end_date": "2012-08-31", "rate": 0.0000870},
+        {"start_date": "2012-09-01", "end_date": "2015-07-31", "rate": 0.0000696},
+        {"start_date": "2015-08-01", "end_date": "2023-08-27", "rate": 0.0000487},
+        {"start_date": "2023-08-28", "end_date": None, "rate": 0.0000341},
+    ],
+    "sz_exchange_handling_fee_rate": [
+        {"start_date": "1900-01-01", "end_date": "2012-05-31", "rate": 0.0001220},
+        {"start_date": "2012-06-01", "end_date": "2012-08-31", "rate": 0.0000870},
+        {"start_date": "2012-09-01", "end_date": "2015-07-31", "rate": 0.0000696},
+        {"start_date": "2015-08-01", "end_date": "2023-08-27", "rate": 0.0000487},
         {"start_date": "2023-08-28", "end_date": None, "rate": 0.0000341},
     ],
     "bse_exchange_handling_fee_rate": [
@@ -58,11 +72,30 @@ MANDATORY_A_SHARE_TRADING_COST_SCHEDULE = {
         {"start_date": "2022-12-01", "end_date": "2023-08-27", "rate": 0.00025},
         {"start_date": "2023-08-28", "end_date": None, "rate": 0.000125},
     ],
-    "transfer_fee_rate": [
+    "sh_transfer_fee_rate": [
+        {"start_date": "1900-01-01", "end_date": "2015-07-31", "rate": 0.0},
+        {"start_date": "2015-08-01", "end_date": "2022-04-28", "rate": 0.00002},
+        {"start_date": "2022-04-29", "end_date": None, "rate": 0.00001},
+    ],
+    "sz_transfer_fee_rate": [
+        {"start_date": "1900-01-01", "end_date": "2015-07-31", "rate": 0.0000255},
+        {"start_date": "2015-08-01", "end_date": "2022-04-28", "rate": 0.00002},
+        {"start_date": "2022-04-29", "end_date": None, "rate": 0.00001},
+    ],
+    "bse_transfer_fee_rate": [
         {"start_date": "1900-01-01", "end_date": "2022-04-28", "rate": 0.00002},
         {"start_date": "2022-04-29", "end_date": None, "rate": 0.00001},
     ],
-    "securities_regulatory_fee_rate": 0.00002,
+    "sh_par_value_transfer_fee_rate": [
+        {"start_date": "1900-01-01", "end_date": "2012-05-31", "rate": 0.0005},
+        {"start_date": "2012-06-01", "end_date": "2012-08-31", "rate": 0.000375},
+        {"start_date": "2012-09-01", "end_date": "2015-07-31", "rate": 0.0003},
+        {"start_date": "2015-08-01", "end_date": None, "rate": 0.0},
+    ],
+    "securities_regulatory_fee_rate": [
+        {"start_date": "1900-01-01", "end_date": "2011-12-31", "rate": 0.00004},
+        {"start_date": "2012-01-01", "end_date": None, "rate": 0.00002},
+    ],
     "broker_commission_rate": 0.0,
 }
 
@@ -278,9 +311,17 @@ def mandatory_trade_cost_components(
 ):
     side = str(side or "").upper()
     board = classify_a_share_board(code) if code else "SH_SZ"
-    handling_key = (
-        "bse_exchange_handling_fee_rate" if board == "BSE" else "sh_sz_exchange_handling_fee_rate"
-    )
+    normalized_code = str(code or "").zfill(6)
+    exchange = "SH" if normalized_code.startswith("6") else "SZ"
+    if board == "BSE":
+        handling_key = "bse_exchange_handling_fee_rate"
+        transfer_key = "bse_transfer_fee_rate"
+    elif exchange == "SH":
+        handling_key = "sh_exchange_handling_fee_rate"
+        transfer_key = "sh_transfer_fee_rate"
+    else:
+        handling_key = "sz_exchange_handling_fee_rate"
+        transfer_key = "sz_transfer_fee_rate"
     schedule = MANDATORY_A_SHARE_TRADING_COST_SCHEDULE
     configured_commission_rate = (
         _environment_float(
@@ -292,8 +333,10 @@ def mandatory_trade_cost_components(
     return {
         "stamp_tax": _schedule_rate(schedule["stamp_tax_sell_rate"], trade_date) if side == "SELL" else 0.0,
         "exchange_handling_fee": _schedule_rate(schedule[handling_key], trade_date),
-        "securities_regulatory_fee": float(schedule["securities_regulatory_fee_rate"]),
-        "transfer_fee": _schedule_rate(schedule["transfer_fee_rate"], trade_date),
+        "securities_regulatory_fee": _schedule_rate(
+            schedule["securities_regulatory_fee_rate"], trade_date
+        ),
+        "transfer_fee": _schedule_rate(schedule[transfer_key], trade_date),
         "broker_commission": configured_commission_rate,
     }
 
@@ -323,6 +366,7 @@ def mandatory_trade_cost(
     code=None,
     broker_commission_rate=None,
     broker_minimum_commission=None,
+    shares=None,
 ):
     gross = abs(float(amount or 0.0))
     if gross <= 0:
@@ -335,6 +379,15 @@ def mandatory_trade_cost(
     )
     commission_rate = float(components.pop("broker_commission", 0.0))
     statutory_cost = gross * float(sum(components.values()))
+    normalized_code = str(code or "").zfill(6)
+    if normalized_code.startswith("6") and str(trade_date or "9999-12-31")[:10] < "2015-08-01":
+        if shares is not None:
+            statutory_cost += abs(int(shares)) * _schedule_rate(
+                MANDATORY_A_SHARE_TRADING_COST_SCHEDULE[
+                    "sh_par_value_transfer_fee_rate"
+                ],
+                trade_date,
+            )
     minimum_commission = (
         _environment_float("A_SHARE_BROKER_MIN_COMMISSION", 0.0)
         if broker_minimum_commission is None

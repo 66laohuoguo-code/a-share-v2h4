@@ -15,6 +15,8 @@ config/*secret*
 config/*credential*
 MY_LOCAL_GUIDE.md
 AI_PROJECT_HANDOFF_LOCAL.md
+live_trading_official/settings.local.json
+live_trading_official/README_LOCAL.md
 
 # Licensed/raw market data, account data, reports and generated factors
 data/*
@@ -85,9 +87,18 @@ config/*
 !config/v2h4_small_account_20k_best_20260724_sparse_weekly.json
 !config/v2h4_small_account_20k_strict_full_rejected_20260724.json
 !config/v2h4_small_account_20k_sparse_weekly.json
+!config/v2h4_small_account_20k_risk_overlay_auction90_official.json
 !config/v2h4_strategy_10w_weekly_causal.json
 !config/v2h4_strategy_10w_25stock_balanced.json
 !config/v2h4_strategy_10w_20stock_concentrated.json
+!config/v2h4_strategy_10w_20stock_auction975_official.json
 !config/v2h4_strategy_60stock_capacity.json
 !config/v2h4_strategy_80stock_capacity.json
 !config/weekly_capital_strategy_map.json
+!config/risk_model_v31_full_2019_20260717.json
+!config/v22r3_weekly_base.json
+!config/v22r3_weekly_100k_official.json
+!config/v22r3_weekly_560k_official.json
+!config/v22r3_weekly_1m_official.json
+!config/v22s_20k_06_entry_weight_monthly_06.json
+!config/v22s_20k_entry_weight_monthly_06_official.json

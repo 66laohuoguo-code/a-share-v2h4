@@ -1,0 +1,42 @@
+{
+  "weekly_entry_points": [
+    "run_weekly.ps1",
+    "update_live_risk_model.ps1",
+    "weekly_rebalance_v2h.py"
+  ],
+  "market_data_pipeline": [
+    "import_csmar_forward_quotation.py",
+    "validate_clean_data.py",
+    "database_status.py"
+  ],
+  "risk_model_pipeline": [
+    "build_risk_model_data.py",
+    "build_weekly_risk_model.py",
+    "build_v31_alpha_cache.py",
+    "risk_model_status.py"
+  ],
+  "strategy_engine": [
+    "factor_rank_backtest.py",
+    "factor_rank_backtest_v2h.py",
+    "ashare_utils.py",
+    "opening_auction.py",
+    "risk_aware_portfolio.py",
+    "risk_model_reporting.py",
+    "ashare_risk_model.py",
+    "v22_strategy.py",
+    "v31_strategy.py",
+    "small_account_v3.py"
+  ],
+  "formal_configs": [
+    "config/weekly_capital_strategy_map.json",
+    "config/risk_model_v31_full_2019_20260717.json",
+    "config/v22s_20k_entry_weight_monthly_06_official.json",
+    "config/v22s_20k_06_entry_weight_monthly_06.json",
+    "config/v2h4_small_account_20k_risk_overlay_auction90_official.json",
+    "config/v22r3_weekly_100k_official.json",
+    "config/v22r3_weekly_560k_official.json",
+    "config/v22r3_weekly_1m_official.json",
+    "config/v22r3_weekly_base.json",
+    "config/v2h4_strategy_10w_20stock_auction975_official.json"
+  ]
+}

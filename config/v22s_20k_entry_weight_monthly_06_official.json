@@ -1,0 +1,4 @@
+{
+  "extends": "v22s_20k_06_entry_weight_monthly_06.json",
+  "strategy_name": "V2.2S_20k_entry_weight_monthly_06_official"
+}

@@ -1,0 +1,46 @@
+{
+  "model_name": "A-share weekly PIT risk model V3.1 full",
+  "history_start_date": "2019-01-01",
+  "model_start_date": "2021-01-01",
+  "model_end_date": "2026-07-17",
+  "market_return_types": [117, 53],
+  "risk_free_benchmark": "NRI01",
+  "industry_classification_name": "\u8bc1\u76d1\u4f1a\u884c\u4e1a\u5206\u7c7b2012\u5e74\u7248",
+  "industry_classification_schedule": [
+    {
+      "classification_name": "\u8bc1\u76d1\u4f1a\u884c\u4e1a\u5206\u7c7b2001\u5e74\u7248",
+      "effective_date": "1900-01-01"
+    },
+    {
+      "classification_name": "\u8bc1\u76d1\u4f1a\u884c\u4e1a\u5206\u7c7b2012\u5e74\u7248",
+      "effective_date": "2012-10-26"
+    }
+  ],
+  "industry_fallback_classification_names": [
+    "\u4e2d\u56fd\u4e0a\u5e02\u516c\u53f8\u534f\u4f1a\u4e0a\u5e02\u516c\u53f8\u884c\u4e1a\u5206\u7c7b"
+  ],
+  "industry_group_digits": 1,
+  "industry_base_group": "C",
+  "beta_window_days": 252,
+  "beta_minimum_days": 126,
+  "beta_half_life_days": 63,
+  "momentum_lookback_days": 252,
+  "momentum_skip_days": 21,
+  "liquidity_windows_days": [21, 63, 252],
+  "maximum_stale_calendar_days": 10,
+  "minimum_history_days": 126,
+  "minimum_average_amount": 5000000.0,
+  "exclude_special_treatment": true,
+  "winsor_mad_width": 5.0,
+  "robust_regression_iterations": 2,
+  "huber_k": 2.5,
+  "minimum_factor_history_weeks": 26,
+  "factor_covariance_window_weeks": 156,
+  "factor_covariance_half_life_weeks": 52,
+  "factor_covariance_shrinkage": 0.1,
+  "newey_west_lags": 2,
+  "minimum_specific_history_weeks": 20,
+  "specific_risk_half_life_weeks": 26,
+  "specific_risk_shrinkage": 0.2,
+  "raw_commit_every_codes": 10
+}

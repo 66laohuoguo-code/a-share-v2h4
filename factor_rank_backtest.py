@@ -135,12 +135,17 @@ def build_industry_metrics(window, market_returns):
     return pd.DataFrame(rows).set_index("industry_1")
 
 
-def price_limit_rate(code):
+def price_limit_rate(code, trade_date=None, listed_state=None):
     code = str(code).zfill(6)
-    if code.startswith(("300", "301", "688")):
+    if str(listed_state or "").upper() == "ST":
+        return 0.05
+    if code.startswith(("688", "689")):
         return 0.20
     if code.startswith(("8", "4", "920")):
         return 0.30
+    if code.startswith(("300", "301")):
+        date = str(trade_date or "9999-12-31")[:10]
+        return 0.20 if date >= "2020-08-24" else 0.10
     return 0.10
 
 
@@ -150,11 +155,22 @@ def trading_dates(conn):
 
 
 def load_prices(conn, start_date, end_date):
+    available = {
+        row[1] for row in conn.execute("PRAGMA table_info(stock_daily)").fetchall()
+    }
+    optional = [
+        column
+        for column in (
+            "limit_down", "limit_up", "limit_status", "no_price_limit"
+        )
+        if column in available
+    ]
+    optional_sql = "" if not optional else ", " + ", ".join(optional)
     return pd.read_sql_query(
-        """
+        f"""
         SELECT code, name, trade_date, prev_close, open, high, low, close,
                amount, daily_return, capital_return, adj_factor, turnover_total,
-               listed_state, industry_1, industry_2
+               listed_state, industry_1, industry_2{optional_sql}
         FROM stock_daily
         WHERE trade_date BETWEEN ? AND ?
         """,
@@ -695,15 +711,27 @@ def build_targets(features, holdings, args, target_equity_weight, portfolio_valu
 def blocked_by_price_limit(code, row, side, args):
     if bool(args.disable_limit_trade_filter):
         return False
+    if bool(row.get("no_price_limit", False)):
+        return False
     prev_close = row.get("prev_close")
     open_price = row.get("open")
     if prev_close is None or open_price is None or pd.isna(prev_close) or pd.isna(open_price):
         return False
     if prev_close <= 0 or open_price <= 0:
         return False
-    open_return = float(open_price) / float(prev_close) - 1.0
-    limit = price_limit_rate(code)
     buffer = float(args.limit_trade_buffer)
+    limit_up = safe_number(row.get("limit_up"))
+    limit_down = safe_number(row.get("limit_down"))
+    if side == "BUY" and math.isfinite(limit_up) and limit_up > 0:
+        return float(open_price) >= limit_up * (1.0 - buffer)
+    if side == "SELL" and math.isfinite(limit_down) and limit_down > 0:
+        return float(open_price) <= limit_down * (1.0 + buffer)
+    open_return = float(open_price) / float(prev_close) - 1.0
+    limit = price_limit_rate(
+        code,
+        row.get("trade_date"),
+        row.get("listed_state"),
+    )
     if side == "BUY" and open_return >= limit - buffer:
         return True
     if side == "SELL" and open_return <= -limit + buffer:
@@ -758,7 +786,7 @@ def execute_trades(trade_date, decision_date, holdings, cash, targets, prices, p
         if shares <= 0:
             continue
         gross = shares * float(order["price"])
-        fee = mandatory_trade_cost(gross, "SELL", trade_date, code)
+        fee = mandatory_trade_cost(gross, "SELL", trade_date, code, shares=shares)
         holdings[code] = int(holdings.get(code, 0)) - shares
         if holdings[code] == 0:
             holdings.pop(code, None)
@@ -776,7 +804,7 @@ def execute_trades(trade_date, decision_date, holdings, cash, targets, prices, p
         shares = int(minimum + math.floor((shares - minimum) / increment) * increment)
         while shares >= minimum:
             gross = shares * float(order["price"])
-            fee = mandatory_trade_cost(gross, "BUY", trade_date, code)
+            fee = mandatory_trade_cost(gross, "BUY", trade_date, code, shares=shares)
             if gross + fee <= cash + 1e-8:
                 break
             shares -= increment
@@ -785,7 +813,7 @@ def execute_trades(trade_date, decision_date, holdings, cash, targets, prices, p
         gross = shares * float(order["price"])
         if gross < float(args.min_trade_value):
             continue
-        fee = mandatory_trade_cost(gross, "BUY", trade_date, code)
+        fee = mandatory_trade_cost(gross, "BUY", trade_date, code, shares=shares)
         cash -= gross + fee
         holdings[code] = int(holdings.get(code, 0)) + shares
         order.update({"shares": shares, "gross_amount": gross, "fee": fee, "cash_after": cash})
