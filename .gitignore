@@ -1,4 +1,4 @@
-# Python environments and caches
+﻿# Python environments and caches
 .venv/
 venv/
 __pycache__/
@@ -13,8 +13,6 @@ __pycache__/
 config/portfolio_config.local.json
 config/*secret*
 config/*credential*
-MY_LOCAL_GUIDE.md
-AI_PROJECT_HANDOFF_LOCAL.md
 live_trading_official/settings.local.json
 live_trading_official/README_LOCAL.md
 
@@ -29,6 +27,7 @@ data/input/*
 # Generated research and temporary files
 outputs/
 output/
+models/
 work/
 tmp/
 *.sqlite
@@ -50,31 +49,8 @@ Thumbs.db
 .codex/
 
 # Unrelated local materials that happen to share the workspace root
-24101102437黄子嫚-汉语言文学师范-旅映非遗微度假平台/
-24101102437黄子嫚-汉语言文学师范-旅映非遗微度假平台.zip
-benchmark_plan.docx
-vibe_coding_tutorial/
-vibe_coding_zero_beginner/
 
 # Internal research history and deprecated experiments are not part of the public product
-README_V2.md
-README_portfolio.md
-GITHUB_UPLOAD.md
-analyze_core_satellite.py
-deepseek_event_signals.py
-factor_diagnostics.py
-factor_rank_backtest_v2.py
-factor_rank_backtest_v2_1.py
-factor_rank_backtest_v2_c1_no_industry.py
-factor_rank_backtest_v2e.py
-fetch_event_feeds.py
-financial_reports.py
-historical_deepseek_weekly_signals.py
-inspect_resset_xlsx.py
-inspect_resset_xlsx_fast.py
-portfolio_rebalance.py
-run_v2_experiments.ps1
-scripts/
 
 # Only reproducible, non-secret public strategy configurations are included
 config/*
@@ -102,3 +78,85 @@ config/*
 !config/v22r3_weekly_1m_official.json
 !config/v22s_20k_06_entry_weight_monthly_06.json
 !config/v22s_20k_entry_weight_monthly_06_official.json
+
+
+# ======================================================================================
+# 因子公式硬隔离（自动追加）
+# ======================================================================================
+# 为什么需要这一节：上面的 *_LOCAL.md 与 config 白名单是**逐条枚举**，
+# git 的语义是**最后一个匹配的模式生效**，所以把这一节放在文件末尾，
+# 即可覆盖上面所有 `!config/...` 白名单，无需改动那段脆弱的枚举。
+# 本仓库 core.ignorecase=true，以下模式大小写不敏感。
+
+# --- 因子研究源码 ---
+*_factor_research.py
+*_factor_research.ps1
+test_*_factor_research.py
+test_*_factor.py
+
+# --- 本轮与近期的因子脚本 ---
+run_nf*_*.ps1
+
+# --- 其他自有因子模块 ---
+
+# --- 本地研究文档（通配替代逐条枚举） ---
+*_LOCAL.md
+*_FACTOR_RESEARCH_GUIDE.md
+
+# --- 因子配置（取消上面的 !config 白名单） ---
+
+# --- 个人资料与含本机路径的文档 ---
+
+# 工作区内的临时产物与权威库副本
+data/processed/
+outputs/
+.worktmp/
+*.sqlite-wal
+*.sqlite-shm
+
+# --- 硬隔离第二轮补充 ---
+# 补充：漏掉的因子脚本与单测
+run_*_factor.ps1
+run_*_factor_research.ps1
+tests/test_factor_statistics.py
+# 补充：含权威库绝对路径的构建脚本
+build_portfolio_optimizer_*.py
+*FACTOR*GUIDE.md
+# 补充：本地备份与临时文件
+.gitignore.bak*
+*.bak_*
+
+# --- 硬隔离第三轮：run_* 入口脚本 ---
+run_*_research.ps1
+run_*_followups.ps1
+run_*_diagnostic*.ps1
+run_*_attribution.ps1
+run_*_tail_filter.ps1
+run_*_seasonality.ps1
+
+# --- 硬隔离第四轮：漏掉的研究/审计脚本与内部清单 ---
+*_research.py
+*_research.ps1
+test_*_research.py
+*_attribution.py
+test_*_attribution.py
+*_audit.py
+test_*_audit.py
+test_*_diagnostic.py
+*_neural*.py
+test_*_neural*.py
+test_*_momentum*.py
+analyze_*_attribution.py
+audit_style_controls.py
+*_PARAMETER_AUDIT.md
+*_FILE_INVENTORY.csv
+*_FILE_HASHES.csv
+*_HASH_VALIDATION.json
+*_COPY_VALIDATION*.json
+*SNAPSHOT*.json
+*SNAPSHOT*.csv
+*SNAPSHOT*.md
+
+# Private research artifacts (source, notes, parameter configs) are excluded
+# locally via .git/info/exclude, which is never committed. Keeping the concrete
+# names there means this public file stays free of project-specific identifiers.
