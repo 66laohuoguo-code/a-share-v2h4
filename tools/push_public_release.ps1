@@ -1,4 +1,4 @@
-﻿# Safe public-release push wrapper: audit first, then push.
+# Safe public-release push wrapper: audit first, then push.
 #
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\push_public_release.ps1 `
 #       -Message "Add factor evaluation toolkit" -Files a.py,b.md -DryRun
@@ -7,6 +7,11 @@
 #   -DryRun                 stage + audit only; do not commit or push
 #   -Forbid "D:\my\data","myuser"   extra substrings that must not appear in the payload
 #   -GitPath <path>         force a specific git.exe
+#
+# Both -Files and -Forbid are comma-split, because `powershell -File` collapses
+# an array argument into a single string. Without that split, `-Forbid a,b`
+# silently degrades to one never-matching fragment and the audit passes for the
+# wrong reason.
 #
 # Why not `git add .`: an enumerated .gitignore always lags behind new files.
 # The moment you add a research script and forget one line, `git add .` ships it.
@@ -28,6 +33,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 # `powershell -File` passes a comma list as ONE string, so split it back into an array.
 $Files = @($Files | ForEach-Object { $_ -split ',' } | Where-Object { $_ -ne '' } | ForEach-Object { $_.Trim() })
+$Forbid = @($Forbid | ForEach-Object { $_ -split ',' } | Where-Object { $_ -ne '' } | ForEach-Object { $_.Trim() })
 
 function Resolve-Git {
     param([string]$Explicit)
@@ -100,6 +106,12 @@ try {
     $staged | ForEach-Object { Write-Host "   $_" }
 
     Write-Host "`n== 4/5 leak audit" -ForegroundColor Cyan
+    if ($Forbid.Count -gt 0) {
+        Write-Host "   extra forbidden fragments: $($Forbid.Count)"
+        foreach ($fragment in $Forbid) { Write-Host "     - $fragment" }
+    } else {
+        Write-Host "   no extra -Forbid fragments" -ForegroundColor Yellow
+    }
     $listFile = Join-Path $repo '.git\public_release_staged.txt'
     $staged | Set-Content -Path $listFile -Encoding utf8
     $auditArgs = @('tools\audit_public_release.py', '--root', '.', '--from-file', $listFile)

@@ -48,10 +48,22 @@ from risk_aware_portfolio import (
     WeeklyRiskModelStore,
     apply_store_overlay,
 )
-from portfolio_optimization import (
-    CausalPortfolioCalibrationStore,
-    apply_store_portfolio_optimization,
-)
+try:
+    from portfolio_optimization import (
+        CausalPortfolioCalibrationStore,
+        apply_store_portfolio_optimization,
+    )
+except ImportError:  # optional component; not present in every checkout
+
+    def _optional_portfolio_optimization(*_args, **_kwargs):
+        raise RuntimeError(
+            "portfolio_optimization.py is required for a non-baseline "
+            "--portfolio-optimization-mode."
+        )
+
+    CausalPortfolioCalibrationStore = _optional_portfolio_optimization
+    apply_store_portfolio_optimization = _optional_portfolio_optimization
+
 from small_account_v3 import (
     commission_efficient_trade_floor,
     optimize_discrete_target_shares,
@@ -70,8 +82,43 @@ from v22_strategy import (
     apply_structural_components as apply_v22_structural_components,
     blend_continuous_industry_satellite,
 )
-from v23_strategy import apply_offensive_participation_tilt
-from multifactor_neural import score_neural_factor
+try:
+    from v23_strategy import apply_offensive_participation_tilt
+except ImportError:  # optional component; not present in every checkout
+
+    def apply_offensive_participation_tilt(
+        features,
+        core_score,
+        *,
+        tilt_weight,
+        excluded_industries=(),
+        top_industries=0,
+        minimum_industry_stocks=20,
+    ):
+        """Identity stand-in used when the V2.3 overlay module is absent."""
+        weight = min(0.50, max(0.0, float(tilt_weight)))
+        if weight > 0.0:
+            raise RuntimeError(
+                "v23_strategy.py is required for a non-zero "
+                "--v23-offensive-alpha-tilt-weight."
+            )
+        result = features.copy()
+        result["v23_offensive_tilt_weight"] = weight
+        result["v23_participation_leader"] = False
+        result["v23_participation_industry_rank"] = 0
+        return core_score, result
+
+
+try:
+    from multifactor_neural import score_neural_factor
+except ImportError:  # optional component; not present in every checkout
+
+    def score_neural_factor(*_args, **_kwargs):
+        raise RuntimeError(
+            "multifactor_neural.py is required for --neural-factor-model."
+        )
+
+
 from ashare_utils import (
     apply_risk_alignment_trade_floor,
     buy_order_size_rules,
@@ -1303,6 +1350,7 @@ def checkpoint_fingerprint(args) -> str:
         "code_sha256": {
             str(path): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in code_files
+            if path.exists()
         },
         "risk_database": risk_database,
         "risk_database_before_cutover": risk_database_before_cutover,

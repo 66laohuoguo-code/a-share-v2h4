@@ -1,4 +1,4 @@
-﻿# Python environments and caches
+# Python environments and caches
 .venv/
 venv/
 __pycache__/
@@ -156,6 +156,14 @@ audit_style_controls.py
 *SNAPSHOT*.json
 *SNAPSHOT*.csv
 *SNAPSHOT*.md
+
+# Safety copies of the object database taken before a history rewrite. Each one
+# is a full .git clone sitting inside the work tree: git would record it as a
+# nested-repository entry, which is useless in a public history and would drag
+# unreachable objects along with it.
+.git.backup_*/
+.git.backup_*.tar
+.git.backup_*.zip
 
 # Private research artifacts (source, notes, parameter configs) are excluded
 # locally via .git/info/exclude, which is never committed. Keeping the concrete
