@@ -12,19 +12,11 @@ import numpy as np
 import pandas as pd
 
 import factor_rank_backtest as base
+import component_weights
 
 
-DEFAULT_COMPONENT_WEIGHTS = {
-    "low_beta_score": 0.10,
-    "low_volatility_score": 0.12,
-    "low_turnover_score": 0.08,
-    "lower_drawdown_score": 0.08,
-    "industry_trend_score": 0.12,
-    "earnings_yield_score": 0.16,
-    "quality_score_v31": 0.14,
-    "growth_score_v31": 0.10,
-    "residual_momentum_score": 0.10,
-}
+DEFAULT_COMPONENT_WEIGHTS = component_weights.load('v31_default')
+
 
 DEFENSIVE_COMPONENTS = (
     "low_beta_score",

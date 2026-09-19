@@ -13,9 +13,12 @@ point-in-time data loading and feature construction, then replaces four layers:
 from __future__ import annotations
 
 import argparse
+import gc
 import gzip
 import hashlib
+import inspect
 import json
+import component_weights
 import math
 import os
 import pickle
@@ -45,6 +48,10 @@ from risk_aware_portfolio import (
     WeeklyRiskModelStore,
     apply_store_overlay,
 )
+from portfolio_optimization import (
+    CausalPortfolioCalibrationStore,
+    apply_store_portfolio_optimization,
+)
 from small_account_v3 import (
     commission_efficient_trade_floor,
     optimize_discrete_target_shares,
@@ -63,6 +70,8 @@ from v22_strategy import (
     apply_structural_components as apply_v22_structural_components,
     blend_continuous_industry_satellite,
 )
+from v23_strategy import apply_offensive_participation_tilt
+from multifactor_neural import score_neural_factor
 from ashare_utils import (
     apply_risk_alignment_trade_floor,
     buy_order_size_rules,
@@ -79,27 +88,65 @@ from ashare_utils import (
 DEFAULT_DATABASE = Path("data/processed/stock_daily.sqlite")
 DEFAULT_OUTPUT_DIR = Path("outputs/backtest_v2")
 CHECKPOINT_VERSION = 1
-FEATURE_CACHE_VERSION = 1
+FEATURE_CACHE_VERSION = 2
+MARKET_STATE_CACHE_VERSION = 1
+
+FULL_PRICE_COLUMNS = (
+    "code",
+    "name",
+    "trade_date",
+    "prev_close",
+    "open",
+    "high",
+    "low",
+    "close",
+    "amount",
+    "daily_return",
+    "capital_return",
+    "adj_factor",
+    "turnover_total",
+    "listed_state",
+    "industry_1",
+    "industry_2",
+    "limit_down",
+    "limit_up",
+    "limit_status",
+    "no_price_limit",
+)
+MARKET_PRICE_COLUMNS = ("code", "trade_date", "close", "daily_return")
+RUNTIME_PRICE_COLUMNS = (
+    "code",
+    "name",
+    "trade_date",
+    "prev_close",
+    "open",
+    "high",
+    "low",
+    "close",
+    "daily_return",
+    "capital_return",
+    "listed_state",
+    "limit_down",
+    "limit_up",
+    "limit_status",
+    "no_price_limit",
+)
+PRICE_CATEGORY_COLUMNS = (
+    "code",
+    "name",
+    "trade_date",
+    "listed_state",
+    "industry_1",
+    "industry_2",
+)
 
 # The original low-beta/industry mix, re-normalized so the weights sum to one.
-STATIC_COMPONENT_WEIGHTS: Dict[str, float] = {
-    "low_beta_score": 0.25,
-    "low_volatility_score": 0.21,
-    "low_turnover_score": 0.17,
-    "reversal_score": 0.15,
-    "lower_drawdown_score": 0.10,
-    "industry_trend_score": 0.12,
-}
-SMALL_ACCOUNT_V3_COMPONENT_WEIGHTS: Dict[str, float] = {
-    "low_beta_score": 0.07,
-    "low_volatility_score": 0.18,
-    "low_turnover_score": 0.13,
-    "reversal_score": 0.12,
-    "lower_drawdown_score": 0.05,
-    "industry_trend_score": 0.10,
-    "earnings_yield_score": 0.25,
-    "residual_momentum_score": 0.10,
-}
+STATIC_COMPONENT_WEIGHTS = component_weights.load('static')
+
+V31_ALPHA_COMPONENT_WEIGHTS = component_weights.load('v31_alpha')
+
+SMALL_ACCOUNT_V3_COMPONENT_WEIGHTS = component_weights.load('small_account_v3')
+
 EVENT_COMPONENT = "industry_event_score_ranked"
 
 
@@ -111,7 +158,37 @@ def configured_component_weights(args) -> Dict[str, float]:
         )
     if profile == "china_small_v3":
         return dict(SMALL_ACCOUNT_V3_COMPONENT_WEIGHTS)
-    return dict(STATIC_COMPONENT_WEIGHTS)
+    configured = getattr(args, "v2_component_weights", None)
+    source = dict(STATIC_COMPONENT_WEIGHTS)
+    if configured:
+        unknown = sorted(set(configured) - set(source))
+        if unknown:
+            raise ValueError(
+                "Unknown V2 component weights: " + ", ".join(unknown)
+            )
+        source.update({name: float(value) for name, value in configured.items()})
+    values = pd.Series(source, dtype=float).clip(lower=0.0)
+    if values.sum() <= 0:
+        raise ValueError("V2 component weights must contain a positive value")
+    return (values / values.sum()).to_dict()
+
+
+def configured_v31_alpha_component_weights(args) -> Dict[str, float]:
+    configured = getattr(args, "v31_alpha_component_weights", None)
+    source = dict(V31_ALPHA_COMPONENT_WEIGHTS)
+    if configured:
+        unknown = sorted(set(configured) - set(source))
+        if unknown:
+            raise ValueError(
+                "Unknown V3.1 alpha component weights: " + ", ".join(unknown)
+            )
+        source.update({name: float(value) for name, value in configured.items()})
+    values = pd.Series(source, dtype=float).clip(lower=0.0)
+    if values.sum() <= 0:
+        raise ValueError(
+            "V3.1 alpha component weights must contain a positive value"
+        )
+    return (values / values.sum()).to_dict()
 
 
 def resolved_v31_industry_budget_mode(args) -> str:
@@ -133,6 +210,7 @@ def uses_v31_alpha_features(args) -> bool:
     return (
         profile == "v31"
         or float(getattr(args, "v31_alpha_tilt_weight", 0.0)) > 0.0
+        or float(getattr(args, "v23_offensive_alpha_tilt_weight", 0.0)) > 0.0
         or resolved_v31_industry_budget_mode(args) == "soft"
     )
 
@@ -153,6 +231,56 @@ def v22_market_risk_on_strength(regime: Mapping[str, object], args) -> float:
     return clip((target - floor) / (ceiling - floor), 0.0, 1.0)
 
 
+def v23_offensive_activation_strength(
+    regime: Mapping[str, object], args
+) -> float:
+    mode = str(
+        getattr(args, "v23_offensive_activation_mode", "always")
+    ).strip().lower()
+    if mode == "always":
+        return 1.0
+    if mode != "fast_rebound":
+        raise ValueError(f"Unsupported V2.3 offensive activation mode: {mode}")
+
+    return_5 = safe_float(regime.get("market_return_5"), np.nan)
+    return_10 = safe_float(regime.get("market_return_10"), np.nan)
+    return_20 = safe_float(regime.get("market_return_20"), np.nan)
+    up_breadth_5 = safe_float(regime.get("market_up_breadth_5"), np.nan)
+    required = (return_5, return_10, return_20, up_breadth_5)
+    if not all(math.isfinite(value) for value in required):
+        return 0.0
+    active = (
+        return_5 >= float(args.v23_fast_rebound_return_5_min)
+        and return_10 >= float(args.v23_fast_rebound_return_10_min)
+        and return_20 <= float(args.v23_fast_rebound_return_20_max)
+        and up_breadth_5 >= float(args.v23_fast_rebound_up_breadth_5_min)
+    )
+    return 1.0 if active else 0.0
+
+
+def augment_fast_market_state(
+    market_state: pd.DataFrame, prices: pd.DataFrame
+) -> pd.DataFrame:
+    result = market_state.copy()
+    index = pd.to_numeric(result["market_index"], errors="coerce")
+    result["market_return_5"] = index / index.shift(5) - 1.0
+    result["market_return_10"] = index / index.shift(10) - 1.0
+
+    returns = prices[["trade_date", "daily_return"]].copy()
+    returns["daily_return"] = pd.to_numeric(
+        returns["daily_return"], errors="coerce"
+    ).clip(-0.12, 0.12)
+    returns["positive_return"] = returns["daily_return"].gt(0.0).where(
+        returns["daily_return"].notna()
+    )
+    up_fraction = returns.groupby("trade_date")["positive_return"].mean()
+    result["market_up_fraction"] = up_fraction.reindex(result.index)
+    result["market_up_breadth_5"] = result["market_up_fraction"].rolling(
+        5, min_periods=5
+    ).mean()
+    return result
+
+
 def resolved_economic_replacement_policy(args) -> str:
     policy = str(
         getattr(args, "economic_replacement_policy", "auto")
@@ -166,6 +294,251 @@ def resolved_economic_replacement_policy(args) -> str:
     return policy
 
 
+def stock_daily_columns(conn: sqlite3.Connection) -> List[str]:
+    return [str(row[1]) for row in conn.execute("PRAGMA table_info(stock_daily)")]
+
+
+def attach_trade_date_boundaries(frame: pd.DataFrame) -> pd.DataFrame:
+    """Cache compact date-to-row boundaries for frames ordered by trade date."""
+    if frame.empty or "trade_date" not in frame:
+        frame.attrs["trade_date_keys"] = []
+        frame.attrs["trade_date_offsets"] = [0]
+        return frame
+    values = frame["trade_date"]
+    if isinstance(values.dtype, pd.CategoricalDtype):
+        category_values = np.asarray(values.cat.categories.astype(str), dtype=object)
+        codes = values.cat.codes.to_numpy(copy=False)
+        if (codes < 0).any():
+            raise ValueError("stock_daily.trade_date contains missing values")
+        boundaries = np.flatnonzero(codes[1:] != codes[:-1]) + 1
+        starts = np.concatenate(([0], boundaries)).astype(np.int64, copy=False)
+        keys = category_values[codes[starts]].tolist()
+    else:
+        raw = values.astype(str).to_numpy(copy=False)
+        boundaries = np.flatnonzero(raw[1:] != raw[:-1]) + 1
+        starts = np.concatenate(([0], boundaries)).astype(np.int64, copy=False)
+        keys = raw[starts].tolist()
+    offsets = starts.tolist()
+    offsets.append(int(len(frame)))
+    frame.attrs["trade_date_keys"] = [str(value) for value in keys]
+    frame.attrs["trade_date_offsets"] = offsets
+    return frame
+
+
+def load_price_columns(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    columns: Sequence[str],
+) -> pd.DataFrame:
+    """Load only required columns and dictionary-encode repeated strings."""
+    available = set(stock_daily_columns(conn))
+    selected = [str(column) for column in columns if str(column) in available]
+    for required in ("code", "trade_date"):
+        if required not in selected:
+            raise ValueError(f"stock_daily is missing required column: {required}")
+    quoted = ", ".join(f'"{column.replace(chr(34), chr(34) * 2)}"' for column in selected)
+    frame = pd.read_sql_query(
+        f"""
+        SELECT {quoted}
+        FROM stock_daily
+        WHERE trade_date BETWEEN ? AND ?
+        ORDER BY trade_date
+        """,
+        conn,
+        params=(str(start_date), str(end_date)),
+        parse_dates=[],
+    )
+    if frame.empty:
+        return attach_trade_date_boundaries(frame)
+    frame["code"] = (
+        frame["code"]
+        .astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(6)
+    )
+    frame["trade_date"] = frame["trade_date"].astype(str).str.slice(0, 10)
+    for column in PRICE_CATEGORY_COLUMNS:
+        if column not in frame:
+            continue
+        categories = pd.Categorical(frame[column], ordered=column == "trade_date")
+        frame[column] = categories
+    return attach_trade_date_boundaries(frame)
+
+
+def load_opening_seed_prices(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    lookback_days: int,
+    max_absolute_gap: float,
+) -> pd.DataFrame:
+    """Load only each stock's valid trailing opening gaps for estimator seeding."""
+    available = set(stock_daily_columns(conn))
+    required = {"code", "trade_date", "prev_close", "open"}
+    missing = sorted(required - available)
+    if missing:
+        raise ValueError(
+            "stock_daily is missing opening-auction columns: " + ", ".join(missing)
+        )
+    frame = pd.read_sql_query(
+        """
+        WITH valid AS (
+            SELECT code, trade_date, prev_close, open
+            FROM stock_daily
+            WHERE trade_date BETWEEN ? AND ?
+              AND prev_close IS NOT NULL
+              AND open IS NOT NULL
+              AND prev_close > 0
+              AND open > 0
+              AND ABS(open / prev_close - 1.0) <= ?
+        ), ranked AS (
+            SELECT code, trade_date, prev_close, open,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY code ORDER BY trade_date DESC
+                   ) AS observation_rank
+            FROM valid
+        )
+        SELECT code, trade_date, prev_close, open
+        FROM ranked
+        WHERE observation_rank <= ?
+        ORDER BY trade_date
+        """,
+        conn,
+        params=(
+            str(start_date),
+            str(end_date),
+            float(max_absolute_gap),
+            max(1, int(lookback_days)),
+        ),
+    )
+    if frame.empty:
+        return attach_trade_date_boundaries(frame)
+    frame["code"] = (
+        frame["code"]
+        .astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(6)
+    )
+    frame["trade_date"] = frame["trade_date"].astype(str).str.slice(0, 10)
+    frame["code"] = pd.Categorical(frame["code"])
+    frame["trade_date"] = pd.Categorical(frame["trade_date"], ordered=True)
+    return attach_trade_date_boundaries(frame)
+
+
+def price_history_window(
+    history: pd.DataFrame,
+    decision_date: str,
+    history_window: int,
+) -> pd.DataFrame:
+    """Return the trailing trading-date window without scanning the full frame."""
+    keys = history.attrs.get("trade_date_keys")
+    offsets = history.attrs.get("trade_date_offsets")
+    if not keys or not offsets:
+        attach_trade_date_boundaries(history)
+        keys = history.attrs.get("trade_date_keys", [])
+        offsets = history.attrs.get("trade_date_offsets", [0])
+    end_date_index = int(np.searchsorted(keys, str(decision_date), side="right")) - 1
+    if end_date_index < 0:
+        return history.iloc[0:0].copy()
+    start_date_index = max(0, end_date_index - max(1, int(history_window)) + 1)
+    start_row = int(offsets[start_date_index])
+    end_row = int(offsets[end_date_index + 1])
+    window = history.iloc[start_row:end_row].copy()
+    for column in PRICE_CATEGORY_COLUMNS:
+        if column in window and isinstance(window[column].dtype, pd.CategoricalDtype):
+            window[column] = window[column].cat.remove_unused_categories()
+    return window
+
+
+def compact_feature_snapshot(
+    history: pd.DataFrame,
+    financial: pd.DataFrame,
+    decision_date: str,
+    args,
+    industry_event_scores: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    history_window = max(
+        int(args.feature_history_days),
+        int(args.min_history_days) + 30,
+        252 + 25,
+    )
+    window = price_history_window(history, decision_date, history_window)
+    result = base.feature_snapshot(
+        window,
+        financial,
+        decision_date,
+        args,
+        industry_event_scores,
+    )
+    for column in result.columns:
+        if isinstance(result[column].dtype, pd.CategoricalDtype):
+            result[column] = result[column].astype(object)
+    return result
+
+
+def build_compact_market_state(prices: pd.DataFrame, args) -> pd.DataFrame:
+    """Build the original market regime fields without object-string copies."""
+    frame = prices.loc[:, list(MARKET_PRICE_COLUMNS)].copy()
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame["daily_return"] = pd.to_numeric(
+        frame["daily_return"], errors="coerce"
+    ).clip(-0.12, 0.12)
+    frame = frame.sort_values(["code", "trade_date"])
+    breadth_window = int(args.market_breadth_window)
+    frame["stock_ma"] = frame.groupby(
+        "code", observed=True, sort=False
+    )["close"].transform(
+        lambda values: values.rolling(
+            breadth_window,
+            min_periods=max(20, breadth_window // 2),
+        ).mean()
+    )
+    frame["above_stock_ma"] = frame["close"] > frame["stock_ma"]
+    frame["positive_return"] = frame["daily_return"].gt(0.0).where(
+        frame["daily_return"].notna()
+    )
+    daily = frame.groupby("trade_date", observed=True, as_index=False).agg(
+        market_return=("daily_return", "mean"),
+        market_breadth=("above_stock_ma", "mean"),
+        stock_count=("code", "nunique"),
+        market_up_fraction=("positive_return", "mean"),
+    )
+    daily["trade_date"] = daily["trade_date"].astype(str)
+    daily["market_return"] = pd.to_numeric(
+        daily["market_return"], errors="coerce"
+    ).fillna(0.0)
+    daily["market_index"] = (1.0 + daily["market_return"]).cumprod()
+    short_window = int(args.market_short_window)
+    long_window = int(args.market_long_window)
+    daily["market_ma_short"] = daily["market_index"].rolling(
+        short_window, min_periods=max(20, short_window // 2)
+    ).mean()
+    daily["market_ma_long"] = daily["market_index"].rolling(
+        long_window, min_periods=max(60, long_window // 2)
+    ).mean()
+    daily["market_return_20"] = (
+        daily["market_index"] / daily["market_index"].shift(20) - 1.0
+    )
+    daily["market_return_60"] = (
+        daily["market_index"] / daily["market_index"].shift(60) - 1.0
+    )
+    daily["market_volatility_20"] = (
+        daily["market_return"].rolling(20, min_periods=10).std(ddof=1)
+        * math.sqrt(244)
+    )
+    daily["market_return_5"] = (
+        daily["market_index"] / daily["market_index"].shift(5) - 1.0
+    )
+    daily["market_return_10"] = (
+        daily["market_index"] / daily["market_index"].shift(10) - 1.0
+    )
+    daily["market_up_breadth_5"] = daily["market_up_fraction"].rolling(
+        5, min_periods=5
+    ).mean()
+    return daily.set_index("trade_date")
+
+
 class BacktestPaused(RuntimeError):
     """Raised after a requested pause has been saved successfully."""
 
@@ -174,12 +547,28 @@ class PriceDateStore:
     """Build daily price dictionaries on demand instead of duplicating the full database."""
 
     def __init__(self, prices: pd.DataFrame, max_cached_dates: int = 32):
-        self.prices = prices.reset_index(drop=True)
+        self.prices = (
+            prices
+            if isinstance(prices.index, pd.RangeIndex)
+            and prices.index.start == 0
+            and prices.index.step == 1
+            else prices.reset_index(drop=True)
+        )
         self.max_cached_dates = max(1, int(max_cached_dates))
-        self.positions_by_date = {
-            str(date): np.asarray(positions, dtype=np.int64)
-            for date, positions in self.prices.groupby("trade_date", sort=False).indices.items()
-        }
+        keys = self.prices.attrs.get("trade_date_keys")
+        offsets = self.prices.attrs.get("trade_date_offsets")
+        if keys and offsets and len(offsets) == len(keys) + 1:
+            self.positions_by_date = {
+                str(date): slice(int(offsets[index]), int(offsets[index + 1]))
+                for index, date in enumerate(keys)
+            }
+        else:
+            self.positions_by_date = {
+                str(date): np.asarray(positions, dtype=np.int64)
+                for date, positions in self.prices.groupby(
+                    "trade_date", observed=True, sort=False
+                ).indices.items()
+            }
         self.cache: OrderedDict[str, Dict[str, Dict[str, object]]] = OrderedDict()
 
     def get(self, date: str, default=None):
@@ -198,9 +587,54 @@ class PriceDateStore:
         return daily
 
 
-def feature_cache_fingerprint(args, database_override: Optional[Path] = None) -> str:
-    database = Path(database_override or args.database).resolve()
-    stat = database.stat()
+class SQLitePriceDateStore:
+    """Read one indexed trading day at a time after feature caches are complete."""
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        columns: Sequence[str] = RUNTIME_PRICE_COLUMNS,
+        max_cached_dates: int = 32,
+    ):
+        self.conn = conn
+        available = set(stock_daily_columns(conn))
+        self.columns = [str(column) for column in columns if str(column) in available]
+        for required in ("code", "trade_date"):
+            if required not in self.columns:
+                raise ValueError(f"stock_daily is missing required column: {required}")
+        quoted = ", ".join(
+            f'"{column.replace(chr(34), chr(34) * 2)}"'
+            for column in self.columns
+        )
+        self.query = (
+            f"SELECT {quoted} FROM stock_daily "
+            "WHERE trade_date = ? ORDER BY code"
+        )
+        self.max_cached_dates = max(1, int(max_cached_dates))
+        self.cache: OrderedDict[str, Dict[str, Dict[str, object]]] = OrderedDict()
+
+    def get(self, date: str, default=None):
+        key = str(date)
+        cached = self.cache.pop(key, None)
+        if cached is not None:
+            self.cache[key] = cached
+            return cached
+        rows = self.conn.execute(self.query, (key,)).fetchall()
+        if not rows:
+            return default
+        code_index = self.columns.index("code")
+        daily: Dict[str, Dict[str, object]] = {}
+        for values in rows:
+            code = str(values[code_index]).zfill(6)
+            daily[code] = dict(zip(self.columns, values))
+            daily[code]["code"] = code
+        self.cache[key] = daily
+        while len(self.cache) > self.max_cached_dates:
+            self.cache.popitem(last=False)
+        return daily
+
+
+def feature_cache_arguments(args) -> Dict[str, object]:
     feature_arguments = {}
     for key in [
         "feature_history_days",
@@ -223,18 +657,155 @@ def feature_cache_fingerprint(args, database_override: Optional[Path] = None) ->
                     "modified_ns": int(path_stat.st_mtime_ns),
                 }
         feature_arguments[key] = value
+    return feature_arguments
+
+
+def feature_definition_sha256() -> str:
+    functions = (
+        base.trailing_median_market_cap,
+        base.trailing_max_drawdown,
+        base.trailing_beta,
+        base.build_industry_metrics,
+        base.latest_industry_event_scores,
+        base.latest_financial_by_code,
+        base.factor_zscore,
+        base.feature_snapshot,
+    )
+    source = "\n\n".join(inspect.getsource(function) for function in functions)
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def feature_cache_fingerprint(args, database_override: Optional[Path] = None) -> str:
+    database = Path(database_override or args.database).resolve()
     payload = {
         "feature_cache_version": FEATURE_CACHE_VERSION,
-        "database": {
-            "path": str(database),
-            "size": int(stat.st_size),
-            "modified_ns": int(stat.st_mtime_ns),
-        },
-        "feature_code_sha256": hashlib.sha256(Path(base.__file__).resolve().read_bytes()).hexdigest(),
-        "arguments": feature_arguments,
+        "database": database_fingerprint_payload(database),
+        "feature_definition_sha256": feature_definition_sha256(),
+        "arguments": feature_cache_arguments(args),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def legacy_feature_cache_fingerprint(
+    args, database_override: Optional[Path] = None
+) -> str:
+    """Reproduce V1 fingerprints so existing multi-year caches remain reusable."""
+    database = Path(database_override or args.database).resolve()
+    payload = {
+        "feature_cache_version": 1,
+        "database": database_fingerprint_payload(database),
+        "feature_code_sha256": hashlib.sha256(
+            Path(base.__file__).resolve().read_bytes()
+        ).hexdigest(),
+        "arguments": feature_cache_arguments(args),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def database_fingerprint_payload(path: Path) -> Dict[str, object]:
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size": int(stat.st_size),
+        "modified_ns": int(stat.st_mtime_ns),
+    }
+
+
+def market_state_fingerprint(
+    args, history_start: str, history_end: str
+) -> str:
+    before_database = getattr(args, "database_before_cutover", None)
+    payload = {
+        "market_state_cache_version": MARKET_STATE_CACHE_VERSION,
+        "database": database_fingerprint_payload(Path(args.database)),
+        "database_before_cutover": (
+            database_fingerprint_payload(Path(before_database))
+            if before_database
+            else None
+        ),
+        "continuous_cutover_date": getattr(args, "continuous_cutover_date", None),
+        "history_start": str(history_start),
+        "history_end": str(history_end),
+        "market_breadth_window": int(args.market_breadth_window),
+        "market_short_window": int(args.market_short_window),
+        "market_long_window": int(args.market_long_window),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def opening_gap_state_fingerprint(
+    args,
+    history_start: str,
+    seed_date: str,
+    estimator: CausalOpeningGapEstimator,
+) -> str:
+    before_database = getattr(args, "database_before_cutover", None)
+    payload = {
+        "opening_gap_cache_version": 1,
+        "database": database_fingerprint_payload(Path(args.database)),
+        "database_before_cutover": (
+            database_fingerprint_payload(Path(before_database))
+            if before_database
+            else None
+        ),
+        "continuous_cutover_date": getattr(args, "continuous_cutover_date", None),
+        "history_start": str(history_start),
+        "seed_date": str(seed_date),
+        "lookback_days": int(estimator.lookback_days),
+        "min_observations": int(estimator.min_observations),
+        "fill_probability": float(estimator.fill_probability),
+        "shrinkage_observations": float(estimator.shrinkage_observations),
+        "market_lookback_days": int(estimator.market_median.maxlen or 60),
+        "max_absolute_gap": float(estimator.max_absolute_gap),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def serialize_opening_gap_estimator(
+    estimator: CausalOpeningGapEstimator,
+) -> Dict[str, object]:
+    return {
+        "stock_gaps": {
+            str(code): list(values)
+            for code, values in estimator.stock_gaps.items()
+        },
+        "market_lower": list(estimator.market_lower),
+        "market_median": list(estimator.market_median),
+        "market_upper": list(estimator.market_upper),
+    }
+
+
+def restore_opening_gap_estimator(
+    estimator: CausalOpeningGapEstimator, state: Mapping[str, object]
+) -> None:
+    estimator.stock_gaps.clear()
+    for code, values in dict(state.get("stock_gaps", {})).items():
+        estimator.stock_gaps[str(code).zfill(6)].extend(
+            float(value) for value in values
+        )
+    estimator.market_lower.clear()
+    estimator.market_lower.extend(
+        float(value) for value in state.get("market_lower", [])
+    )
+    estimator.market_median.clear()
+    estimator.market_median.extend(
+        float(value) for value in state.get("market_median", [])
+    )
+    estimator.market_upper.clear()
+    estimator.market_upper.extend(
+        float(value) for value in state.get("market_upper", [])
+    )
 
 
 class FeatureSnapshotCache:
@@ -258,9 +829,92 @@ class FeatureSnapshotCache:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_states (
+                fingerprint TEXT PRIMARY KEY,
+                row_count INTEGER NOT NULL,
+                payload BLOB NOT NULL,
+                saved_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feature_cache_aliases (
+                fingerprint TEXT PRIMARY KEY,
+                target_fingerprint TEXT NOT NULL,
+                saved_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS opening_gap_states (
+                fingerprint TEXT PRIMARY KEY,
+                stock_count INTEGER NOT NULL,
+                payload BLOB NOT NULL,
+                saved_at TEXT NOT NULL
+            )
+            """
+        )
         self.conn.commit()
 
+    def resolved_fingerprint(self, fingerprint: str) -> str:
+        row = self.conn.execute(
+            """
+            SELECT target_fingerprint
+            FROM feature_cache_aliases
+            WHERE fingerprint = ?
+            """,
+            (str(fingerprint),),
+        ).fetchone()
+        return str(row[0]) if row is not None else str(fingerprint)
+
+    def register_legacy_alias(
+        self, fingerprint: str, legacy_fingerprint: str
+    ) -> bool:
+        fingerprint = str(fingerprint)
+        legacy_fingerprint = str(legacy_fingerprint)
+        if fingerprint == legacy_fingerprint:
+            return False
+        existing = self.conn.execute(
+            """
+            SELECT target_fingerprint
+            FROM feature_cache_aliases
+            WHERE fingerprint = ?
+            """,
+            (fingerprint,),
+        ).fetchone()
+        if existing is not None and str(existing[0]) == legacy_fingerprint:
+            return False
+        current_count = self.conn.execute(
+            "SELECT COUNT(*) FROM feature_snapshots WHERE fingerprint = ?",
+            (fingerprint,),
+        ).fetchone()[0]
+        legacy_count = self.conn.execute(
+            "SELECT COUNT(*) FROM feature_snapshots WHERE fingerprint = ?",
+            (legacy_fingerprint,),
+        ).fetchone()[0]
+        if int(current_count) > 0 or int(legacy_count) <= 0:
+            return False
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO feature_cache_aliases
+                (fingerprint, target_fingerprint, saved_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                fingerprint,
+                legacy_fingerprint,
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+            ),
+        )
+        self.conn.commit()
+        return True
+
     def get(self, fingerprint: str, decision_date: str) -> Optional[pd.DataFrame]:
+        fingerprint = self.resolved_fingerprint(fingerprint)
         row = self.conn.execute(
             """
             SELECT payload
@@ -274,6 +928,7 @@ class FeatureSnapshotCache:
         return pickle.loads(zlib.decompress(row[0]))
 
     def put(self, fingerprint: str, decision_date: str, frame: pd.DataFrame) -> None:
+        fingerprint = self.resolved_fingerprint(fingerprint)
         encoded = zlib.compress(pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL), level=3)
         self.conn.execute(
             """
@@ -292,11 +947,90 @@ class FeatureSnapshotCache:
         self.conn.commit()
 
     def count(self, fingerprint: str) -> int:
+        fingerprint = self.resolved_fingerprint(fingerprint)
         row = self.conn.execute(
             "SELECT COUNT(*) FROM feature_snapshots WHERE fingerprint = ?",
             (str(fingerprint),),
         ).fetchone()
         return int(row[0]) if row else 0
+
+    def missing_dates(
+        self, fingerprint: str, decision_dates: Sequence[str]
+    ) -> List[str]:
+        fingerprint = self.resolved_fingerprint(fingerprint)
+        requested = [str(value) for value in dict.fromkeys(decision_dates)]
+        if not requested:
+            return []
+        rows = self.conn.execute(
+            """
+            SELECT decision_date
+            FROM feature_snapshots
+            WHERE fingerprint = ? AND decision_date BETWEEN ? AND ?
+            """,
+            (str(fingerprint), min(requested), max(requested)),
+        ).fetchall()
+        available = {str(row[0]) for row in rows}
+        return [value for value in requested if value not in available]
+
+    def get_market_state(self, fingerprint: str) -> Optional[pd.DataFrame]:
+        row = self.conn.execute(
+            "SELECT payload FROM market_states WHERE fingerprint = ?",
+            (str(fingerprint),),
+        ).fetchone()
+        if row is None:
+            return None
+        return pickle.loads(zlib.decompress(row[0]))
+
+    def put_market_state(self, fingerprint: str, frame: pd.DataFrame) -> None:
+        encoded = zlib.compress(
+            pickle.dumps(frame, protocol=pickle.HIGHEST_PROTOCOL), level=3
+        )
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO market_states
+                (fingerprint, row_count, payload, saved_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                str(fingerprint),
+                int(len(frame)),
+                sqlite3.Binary(encoded),
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+            ),
+        )
+        self.conn.commit()
+
+    def get_opening_gap_state(
+        self, fingerprint: str
+    ) -> Optional[Dict[str, object]]:
+        row = self.conn.execute(
+            "SELECT payload FROM opening_gap_states WHERE fingerprint = ?",
+            (str(fingerprint),),
+        ).fetchone()
+        if row is None:
+            return None
+        return pickle.loads(zlib.decompress(row[0]))
+
+    def put_opening_gap_state(
+        self, fingerprint: str, state: Mapping[str, object]
+    ) -> None:
+        encoded = zlib.compress(
+            pickle.dumps(dict(state), protocol=pickle.HIGHEST_PROTOCOL), level=3
+        )
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO opening_gap_states
+                (fingerprint, stock_count, payload, saved_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                str(fingerprint),
+                int(len(state.get("stock_gaps", {}))),
+                sqlite3.Binary(encoded),
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+            ),
+        )
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -348,6 +1082,35 @@ class SplitFeatureSnapshotCache:
             self.after_fingerprint
         )
 
+    def missing_dates(
+        self, _fingerprint: str, decision_dates: Sequence[str]
+    ) -> List[str]:
+        before_dates = [
+            str(value) for value in decision_dates if str(value) < self.cutover_date
+        ]
+        after_dates = [
+            str(value) for value in decision_dates if str(value) >= self.cutover_date
+        ]
+        return self.before.missing_dates(
+            self.before_fingerprint, before_dates
+        ) + self.after.missing_dates(self.after_fingerprint, after_dates)
+
+    def get_market_state(self, fingerprint: str) -> Optional[pd.DataFrame]:
+        return self.after.get_market_state(fingerprint)
+
+    def put_market_state(self, fingerprint: str, frame: pd.DataFrame) -> None:
+        self.after.put_market_state(fingerprint, frame)
+
+    def get_opening_gap_state(
+        self, fingerprint: str
+    ) -> Optional[Dict[str, object]]:
+        return self.after.get_opening_gap_state(fingerprint)
+
+    def put_opening_gap_state(
+        self, fingerprint: str, state: Mapping[str, object]
+    ) -> None:
+        self.after.put_opening_gap_state(fingerprint, state)
+
     def close(self) -> None:
         self.before.close()
         self.after.close()
@@ -366,7 +1129,13 @@ def cached_feature_snapshot(
         cached = cache.get(cache_fingerprint, decision_date)
         if cached is not None:
             return cached
-    features = base.feature_snapshot(prices, financial, decision_date, args, industry_events)
+    if prices is None:
+        raise RuntimeError(
+            f"Feature cache miss for {decision_date}, but raw factor history was not loaded."
+        )
+    features = compact_feature_snapshot(
+        prices, financial, decision_date, args, industry_events
+    )
     if cache is not None and cache_fingerprint is not None:
         cache.put(cache_fingerprint, decision_date, features)
     return features
@@ -470,10 +1239,12 @@ def checkpoint_fingerprint(args) -> str:
         Path(base.__file__).resolve(),
         Path(__file__).with_name("opening_auction.py").resolve(),
         Path(__file__).with_name("risk_aware_portfolio.py").resolve(),
+        Path(__file__).with_name("portfolio_optimization.py").resolve(),
         Path(__file__).with_name("risk_model_reporting.py").resolve(),
         Path(__file__).with_name("small_account_v3.py").resolve(),
         Path(__file__).with_name("v31_strategy.py").resolve(),
         Path(__file__).with_name("v22_strategy.py").resolve(),
+        Path(__file__).with_name("multifactor_neural.py").resolve(),
     ]
     risk_database = None
     configured_risk_database = getattr(args, "risk_model_database", None)
@@ -509,6 +1280,18 @@ def checkpoint_fingerprint(args) -> str:
                 "size": int(schedule_stat.st_size),
                 "modified_ns": int(schedule_stat.st_mtime_ns),
             }
+    neural_factor_model = None
+    configured_neural_model = getattr(args, "neural_factor_model", None)
+    if configured_neural_model:
+        neural_path = Path(configured_neural_model).resolve()
+        if neural_path.exists():
+            neural_stat = neural_path.stat()
+            neural_factor_model = {
+                "path": str(neural_path),
+                "size": int(neural_stat.st_size),
+                "modified_ns": int(neural_stat.st_mtime_ns),
+                "sha256": hashlib.sha256(neural_path.read_bytes()).hexdigest(),
+            }
     payload = {
         "checkpoint_version": CHECKPOINT_VERSION,
         "database": {
@@ -524,6 +1307,7 @@ def checkpoint_fingerprint(args) -> str:
         "risk_database": risk_database,
         "risk_database_before_cutover": risk_database_before_cutover,
         "risk_calibration_schedule": risk_calibration_schedule,
+        "neural_factor_model": neural_factor_model,
         "arguments": arguments,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -874,7 +1658,12 @@ def continuous_target_equity(
         "market_state": state,
         "market_index": index,
         "market_breadth": breadth,
+        "market_return_5": safe_float(row.get("market_return_5"), np.nan),
+        "market_return_10": safe_float(row.get("market_return_10"), np.nan),
         "market_return_20": ret20,
+        "market_up_breadth_5": safe_float(
+            row.get("market_up_breadth_5"), np.nan
+        ),
         "market_volatility_20": vol,
         "trend_signal": trend_signal,
         "vol_scale": vol_scale,
@@ -1075,6 +1864,7 @@ def apply_v2_score(
     decision_date: Optional[str] = None,
     satellite_controller: Optional[IndustrySatelliteController] = None,
     market_risk_on_strength: float = 1.0,
+    offensive_activation_strength: float = 1.0,
 ) -> pd.DataFrame:
     result = features.copy()
     profile = str(getattr(args, "score_profile", "v2h4_legacy")).strip().lower()
@@ -1118,15 +1908,47 @@ def apply_v2_score(
             "v31_quality_raw",
             industry_neutral=True,
         )
-        alpha_score = (
-            0.5 * result["earnings_yield_score"]
-            + 0.5 * result["quality_score_v31"]
+        alpha_weights = configured_v31_alpha_component_weights(args)
+        alpha_score = sum(
+            float(weight) * result[name]
+            for name, weight in alpha_weights.items()
         )
         score = (
             (1.0 - alpha_tilt_weight) * base.zscore(score)
             + alpha_tilt_weight * base.zscore(alpha_score)
         )
+    neural_model = getattr(args, "neural_factor_model", None)
+    neural_weight = clip(
+        float(getattr(args, "neural_factor_tilt_weight", 0.0)), 0.0, 1.0
+    )
+    if neural_model and neural_weight > 0.0:
+        neural_score = score_neural_factor(result, neural_model)
+        result["neural_factor_score"] = base.zscore(neural_score).fillna(0.0)
+        score = (
+            (1.0 - neural_weight) * base.zscore(score)
+            + neural_weight * result["neural_factor_score"]
+        )
+    score, result = apply_offensive_participation_tilt(
+        result,
+        score,
+        tilt_weight=float(
+            getattr(args, "v23_offensive_alpha_tilt_weight", 0.0)
+        )
+        * clip(float(offensive_activation_strength), 0.0, 1.0),
+        excluded_industries=list(
+            getattr(args, "v23_offensive_excluded_industries", []) or []
+        ),
+        top_industries=int(
+            getattr(args, "v23_participation_top_industries", 0)
+        ),
+        minimum_industry_stocks=int(
+            getattr(args, "v23_participation_min_industry_stocks", 20)
+        ),
+    )
     result["score_v2_core"] = score
+    result["v23_offensive_activation_strength"] = clip(
+        float(offensive_activation_strength), 0.0, 1.0
+    )
     satellite_application = str(
         getattr(args, "v22_industry_satellite_application", "score_and_weight")
     ).strip().lower()
@@ -1385,7 +2207,7 @@ def select_lot_aware_codes(
         cap = industry_cap(industry)
         if cap <= 0:
             return 0
-        return max(
+        result = max(
             1,
             int(
                 math.ceil(
@@ -1396,12 +2218,95 @@ def select_lot_aware_codes(
                 )
             ),
         )
+        configured_group = {
+            str(value).strip().upper()
+            for value in (
+                getattr(args, "v23_defensive_group_industries", []) or []
+            )
+            if str(value).strip()
+        }
+        configured_limit = max(
+            0,
+            int(getattr(args, "v23_defensive_industry_max_holdings", 0)),
+        )
+        if configured_limit > 0 and industry.upper() in configured_group:
+            result = min(result, configured_limit)
+        return result
     selected: List[str] = []
     industry_counts: Dict[str, int] = {}
     reserved = 0.0
+    defensive_group = {
+        str(value).strip().upper()
+        for value in (
+            getattr(args, "v23_defensive_group_industries", []) or []
+        )
+        if str(value).strip()
+    }
+    defensive_fraction = float(
+        np.clip(
+            float(
+                getattr(
+                    args,
+                    "v23_defensive_group_max_equity_fraction",
+                    1.0,
+                )
+            ),
+            0.0,
+            1.0,
+        )
+    )
+    maximum_defensive_count = desired_count
+    if defensive_group and defensive_fraction < 1.0:
+        maximum_defensive_count = max(
+            0, int(math.floor(desired_count * defensive_fraction + 1e-9))
+        )
+    defensive_count = 0
+    participation_minimum = max(
+        0, int(getattr(args, "v23_participation_min_holdings", 0))
+    )
+    participation_candidates: Dict[str, Tuple[int, str]] = {}
+    if participation_minimum > 0:
+        for code in eligible_order:
+            row = row_by_code.get(code, {})
+            if not bool(row.get("v23_participation_leader", False)):
+                continue
+            industry = industries[code]
+            rank = int(safe_float(row.get("v23_participation_industry_rank"), 0))
+            if rank <= 0 or industry in participation_candidates:
+                continue
+            participation_candidates[industry] = (rank, code)
+        for _, code in sorted(participation_candidates.values()):
+            if len(selected) >= min(participation_minimum, desired_count):
+                break
+            industry = industries[code]
+            lot_value = lot_values[code]
+            if industry_counts.get(industry, 0) >= maximum_count(industry):
+                continue
+            industry_minimum = sum(
+                lot_values[item]
+                for item in selected
+                if industries[item] == industry
+            )
+            if (
+                industry_minimum + lot_value
+                > float(portfolio_value) * industry_cap(industry) + 1e-8
+            ):
+                continue
+            if reserved + lot_value > equity_budget + 1e-8:
+                continue
+            selected.append(code)
+            industry_counts[industry] = industry_counts.get(industry, 0) + 1
+            if industry.upper() in defensive_group:
+                defensive_count += 1
+            reserved += lot_value
     for code in eligible_order:
+        if code in selected:
+            continue
         industry = industries[code]
         lot_value = lot_values[code]
+        is_defensive = industry.upper() in defensive_group
+        if is_defensive and defensive_count >= maximum_defensive_count:
+            continue
         if industry_counts.get(industry, 0) >= maximum_count(industry):
             continue
         if reserved + lot_value > equity_budget + 1e-8:
@@ -1418,6 +2323,8 @@ def select_lot_aware_codes(
             continue
         selected.append(code)
         industry_counts[industry] = industry_counts.get(industry, 0) + 1
+        if is_defensive:
+            defensive_count += 1
         reserved += lot_value
         if len(selected) >= desired_count:
             break
@@ -1432,6 +2339,18 @@ def select_lot_aware_codes(
         "minimum_lot_budget": float(reserved),
         "max_single_lot_budget": float(max_lot_budget),
         "skipped_lot_too_expensive": int(skipped_lot_too_expensive),
+        "v23_participation_requested_holdings": int(participation_minimum),
+        "v23_participation_selected_holdings": int(
+            sum(
+                bool(row_by_code.get(code, {}).get("v23_participation_leader", False))
+                for code in selected
+            )
+        ),
+        "v23_defensive_group_selected_holdings": int(defensive_count),
+        "v23_defensive_group_maximum_holdings": int(maximum_defensive_count),
+        "v23_defensive_industry_max_holdings": int(
+            getattr(args, "v23_defensive_industry_max_holdings", 0)
+        ),
     }
 
 
@@ -1530,7 +2449,6 @@ def cap_and_redistribute_with_minimums(
 
     if float(weights.sum()) > target_equity_weight + 1e-10:
         return weights
-
     for _ in range(100):
         deficit = target_equity_weight - float(weights.sum())
         if deficit <= 1e-8:
@@ -1563,6 +2481,214 @@ def cap_and_redistribute_with_minimums(
         if added < 1e-10:
             break
     return weights.clip(lower=0.0)
+
+
+def cap_industry_group_and_redistribute(
+    weights: pd.Series,
+    industries: pd.Series,
+    group_industries: Iterable[str],
+    maximum_equity_fraction: float,
+    max_stock_weight: float,
+    max_industry_weight: float,
+    industry_caps: Optional[Mapping[str, float]] = None,
+) -> Tuple[pd.Series, Dict[str, float]]:
+    """Bound an industry group's share of the invested equity sleeve."""
+
+    result = safe_series(weights, weights.index).fillna(0.0).clip(lower=0.0)
+    total = float(result.sum())
+    configured = {
+        str(value).strip().upper()
+        for value in group_industries
+        if str(value).strip()
+    }
+    fraction = float(np.clip(float(maximum_equity_fraction), 0.0, 1.0))
+    normalized = normalize_industry_series(industries.reindex(result.index))
+    group_mask = normalized.str.upper().isin(configured)
+    before = float(result.loc[group_mask].sum())
+    metadata = {
+        "v23_defensive_group_weight_before_cap": before,
+        "v23_defensive_group_weight_after_cap": before,
+        "v23_defensive_group_cap_weight": total * fraction,
+    }
+    if (
+        not configured
+        or total <= 0.0
+        or fraction >= 1.0
+        or before <= total * fraction + 1e-12
+    ):
+        return result, metadata
+
+    capped_group = result.loc[group_mask] * ((total * fraction) / before)
+    non_group_index = result.index[~group_mask]
+    non_group_target = max(0.0, total - float(capped_group.sum()))
+    if len(non_group_index) == 0:
+        bounded = pd.Series(0.0, index=result.index)
+        bounded.loc[capped_group.index] = capped_group
+    else:
+        non_group_raw = result.loc[non_group_index]
+        if float(non_group_raw.sum()) <= 0.0:
+            non_group_raw = pd.Series(1.0, index=non_group_index)
+        non_group = cap_and_redistribute(
+            non_group_raw,
+            industries.reindex(non_group_index),
+            non_group_target,
+            max_stock_weight,
+            max_industry_weight,
+            industry_caps=industry_caps,
+        )
+        bounded = pd.Series(0.0, index=result.index)
+        bounded.loc[capped_group.index] = capped_group
+        bounded.loc[non_group.index] = non_group
+    metadata["v23_defensive_group_weight_after_cap"] = float(
+        bounded.loc[group_mask].sum()
+    )
+    return bounded, metadata
+
+
+def enforce_integer_industry_group_cap(
+    target_shares: Mapping[str, int],
+    target_weights: Mapping[str, float],
+    prices: Mapping[str, float],
+    industries: Optional[Mapping[str, str]],
+    portfolio_value: float,
+    group_industries: Iterable[str],
+    maximum_equity_fraction: float,
+    maximum_stock_weight: float,
+) -> Tuple[Dict[str, int], Dict[str, object]]:
+    """Repair lot-rounded targets that overshoot a configured group cap."""
+
+    allocation = {
+        str(code).zfill(6): max(0, int(shares))
+        for code, shares in target_shares.items()
+    }
+    value = max(0.0, float(portfolio_value))
+    normalized_prices = {
+        str(code).zfill(6): safe_float(price, np.nan)
+        for code, price in prices.items()
+    }
+    normalized_industries = {
+        str(code).zfill(6): str(industry).strip().upper()
+        for code, industry in (industries or {}).items()
+    }
+    configured = {
+        str(industry).strip().upper()
+        for industry in group_industries
+        if str(industry).strip()
+    }
+    fraction = float(np.clip(float(maximum_equity_fraction), 0.0, 1.0))
+    equity_budget = value * sum(
+        max(0.0, float(weight)) for weight in target_weights.values()
+    )
+    cap_value = equity_budget * fraction
+
+    def position_value(code: str, shares: int) -> float:
+        price = normalized_prices.get(code, np.nan)
+        if not math.isfinite(price) or price <= 0:
+            return 0.0
+        return max(0, int(shares)) * price
+
+    def is_group(code: str) -> bool:
+        return normalized_industries.get(code, "UNKNOWN") in configured
+
+    def group_value() -> float:
+        return float(
+            sum(
+                position_value(code, shares)
+                for code, shares in allocation.items()
+                if is_group(code)
+            )
+        )
+
+    before = group_value()
+    metadata: Dict[str, object] = {
+        "v23_integer_group_value_before_cap": before,
+        "v23_integer_group_value_after_cap": before,
+        "v23_integer_group_cap_value": cap_value,
+        "v23_integer_group_lots_removed": 0,
+        "v23_integer_non_group_lots_added": 0,
+    }
+    if not configured or value <= 0 or fraction >= 1.0 or before <= cap_value + 1e-8:
+        return allocation, metadata
+
+    removed = 0
+    for _ in range(1000):
+        if group_value() <= cap_value + 1e-8:
+            break
+        choices = []
+        for code, shares in allocation.items():
+            if shares <= 0 or not is_group(code):
+                continue
+            price = normalized_prices.get(code, np.nan)
+            if not math.isfinite(price) or price <= 0:
+                continue
+            minimum, increment = buy_order_size_rules(code)
+            reduced = 0 if shares <= minimum else max(0, shares - increment)
+            current_weight = shares * price / value
+            reduced_weight = reduced * price / value
+            target_weight = max(0.0, float(target_weights.get(code, 0.0)))
+            tracking_cost = (
+                (reduced_weight - target_weight) ** 2
+                - (current_weight - target_weight) ** 2
+            )
+            freed = (shares - reduced) * price
+            choices.append((tracking_cost / max(freed, 1e-8), code, reduced))
+        if not choices:
+            break
+        _, code, reduced = min(choices)
+        allocation[code] = int(reduced)
+        removed += 1
+
+    added = 0
+    for _ in range(1000):
+        invested = float(
+            sum(position_value(code, shares) for code, shares in allocation.items())
+        )
+        remaining = equity_budget - invested
+        if remaining <= 0:
+            break
+        choices = []
+        for raw_code, raw_weight in target_weights.items():
+            code = str(raw_code).zfill(6)
+            if is_group(code):
+                continue
+            price = normalized_prices.get(code, np.nan)
+            if not math.isfinite(price) or price <= 0:
+                continue
+            shares = int(allocation.get(code, 0))
+            minimum, increment = buy_order_size_rules(code)
+            extra = minimum if shares <= 0 else increment
+            lot_value = extra * price
+            if lot_value > remaining + 1e-8:
+                continue
+            increased = shares + extra
+            increased_weight = increased * price / value
+            if increased_weight > max(
+                float(maximum_stock_weight), float(raw_weight) * 1.35
+            ) + 1e-8:
+                continue
+            current_weight = shares * price / value
+            target_weight = max(0.0, float(raw_weight))
+            improvement = (
+                (current_weight - target_weight) ** 2
+                - (increased_weight - target_weight) ** 2
+            )
+            if improvement <= 1e-12:
+                continue
+            choices.append((-improvement / lot_value, code, increased))
+        if not choices:
+            break
+        _, code, increased = min(choices)
+        allocation[code] = int(increased)
+        added += 1
+
+    metadata.update(
+        {
+            "v23_integer_group_value_after_cap": group_value(),
+            "v23_integer_group_lots_removed": int(removed),
+            "v23_integer_non_group_lots_added": int(added),
+        }
+    )
+    return allocation, metadata
 
 
 def apply_v22_satellite_allocation(
@@ -1837,6 +2963,22 @@ def build_targets_v2(
                 industry_caps=industry_caps,
             )
 
+    v23_group_industries = list(
+        getattr(args, "v23_defensive_group_industries", []) or []
+    )
+    v23_group_fraction = float(
+        getattr(args, "v23_defensive_group_max_equity_fraction", 1.0)
+    )
+    desired, v23_group_meta = cap_industry_group_and_redistribute(
+        desired,
+        frame["industry_1"],
+        v23_group_industries,
+        v23_group_fraction,
+        effective_max_stock_weight,
+        effective_max_industry_weight,
+        industry_caps=industry_caps,
+    )
+
     # Avoid spending money on trivial changes; keep target allocations otherwise.
     target = desired.to_dict()
     if not force_risk_alignment:
@@ -1867,6 +3009,22 @@ def build_targets_v2(
             for code, weight in bounded.items()
             if float(weight) > 0
         }
+    if target:
+        bounded_group, final_group_meta = cap_industry_group_and_redistribute(
+            pd.Series(target, dtype=float),
+            all_industries,
+            v23_group_industries,
+            v23_group_fraction,
+            effective_max_stock_weight,
+            effective_max_industry_weight,
+            industry_caps=industry_caps,
+        )
+        target = {
+            code: float(weight)
+            for code, weight in bounded_group.items()
+            if float(weight) > 0
+        }
+        v23_group_meta.update(final_group_meta)
     normalized_industries = normalize_industry_series(
         all_industries.reindex(pd.Index(target, dtype=object))
     )
@@ -1877,6 +3035,13 @@ def build_targets_v2(
             if normalized_industries.get(code, "UNKNOWN") == "UNKNOWN"
         )
     )
+    activation_values = pd.to_numeric(
+        frame.get(
+            "v23_offensive_activation_strength",
+            pd.Series(1.0, index=frame.index),
+        ),
+        errors="coerce",
+    ).dropna()
     return target, {
         "selected_count": int(len(selected)),
         "target_weight_sum": float(sum(target.values())),
@@ -1893,9 +3058,36 @@ def build_targets_v2(
         "v31_alpha_tilt_weight": float(
             getattr(args, "v31_alpha_tilt_weight", 0.0)
         ),
+        "v23_offensive_alpha_tilt_weight": float(
+            getattr(args, "v23_offensive_alpha_tilt_weight", 0.0)
+        ),
+        "v23_offensive_activation_mode": str(
+            getattr(args, "v23_offensive_activation_mode", "always")
+        ),
+        "v23_offensive_activation_strength": (
+            float(activation_values.max()) if not activation_values.empty else 1.0
+        ),
+        "v23_offensive_excluded_industries": list(
+            getattr(args, "v23_offensive_excluded_industries", []) or []
+        ),
+        "v23_participation_top_industries": int(
+            getattr(args, "v23_participation_top_industries", 0)
+        ),
+        "v23_participation_min_industry_stocks": int(
+            getattr(args, "v23_participation_min_industry_stocks", 20)
+        ),
+        "v23_participation_min_holdings": int(
+            getattr(args, "v23_participation_min_holdings", 0)
+        ),
+        "v23_defensive_group_industries": v23_group_industries,
+        "v23_defensive_group_max_equity_fraction": v23_group_fraction,
+        "v23_defensive_industry_max_holdings": int(
+            getattr(args, "v23_defensive_industry_max_holdings", 0)
+        ),
         "unknown_target_weight": unknown_target_weight,
         "force_risk_alignment": bool(force_risk_alignment),
         **v22_meta,
+        **v23_group_meta,
         **transform_meta,
         **lot_meta,
     }
@@ -2270,6 +3462,17 @@ def execute_trades_v2(
             planning_portfolio_value if auction_mode else portfolio_open_value,
             target_prices,
         )
+    target_shares_by_code, v23_integer_meta = enforce_integer_industry_group_cap(
+        target_shares_by_code,
+        targets,
+        target_prices,
+        industries,
+        planning_portfolio_value if auction_mode else portfolio_open_value,
+        getattr(args, "v23_defensive_group_industries", []) or [],
+        float(getattr(args, "v23_defensive_group_max_equity_fraction", 1.0)),
+        float(getattr(args, "lot_aware_max_stock_weight", args.max_stock_weight)),
+    )
+    integer_meta.update(v23_integer_meta)
     weight_value = (
         planning_portfolio_value if auction_mode else float(portfolio_open_value)
     )
@@ -2538,6 +3741,11 @@ def make_summary(equity: pd.DataFrame, trades: pd.DataFrame, initial_cash: float
         .astype(str)
         .eq("applied")
     )
+    optimization_applied = (
+        equity.get("portfolio_optimization_status", pd.Series(dtype=str))
+        .astype(str)
+        .eq("applied")
+    )
     return {
         "strategy": "factor_rank_v2_continuous_risk",
         "strategy_name": str(getattr(args, "strategy_name", "V2H")),
@@ -2570,10 +3778,63 @@ def make_summary(equity: pd.DataFrame, trades: pd.DataFrame, initial_cash: float
             if getattr(args, "risk_model_database_before_cutover", None)
             else None
         ),
+        "optimizer_calibration_schedule": (
+            str(Path(args.optimizer_calibration_schedule).resolve())
+            if getattr(args, "optimizer_calibration_schedule", None)
+            else None
+        ),
         "score_profile": str(getattr(args, "score_profile", "v2h4_legacy")),
         "v31_industry_budget_mode": resolved_v31_industry_budget_mode(args),
         "v31_alpha_tilt_weight": float(
             getattr(args, "v31_alpha_tilt_weight", 0.0)
+        ),
+        "v23_offensive_alpha_tilt_weight": float(
+            getattr(args, "v23_offensive_alpha_tilt_weight", 0.0)
+        ),
+        "v23_offensive_activation_mode": str(
+            getattr(args, "v23_offensive_activation_mode", "always")
+        ),
+        "v23_fast_rebound_return_5_min": float(
+            getattr(args, "v23_fast_rebound_return_5_min", 0.03)
+        ),
+        "v23_fast_rebound_return_10_min": float(
+            getattr(args, "v23_fast_rebound_return_10_min", 0.0)
+        ),
+        "v23_fast_rebound_return_20_max": float(
+            getattr(args, "v23_fast_rebound_return_20_max", 0.02)
+        ),
+        "v23_fast_rebound_up_breadth_5_min": float(
+            getattr(args, "v23_fast_rebound_up_breadth_5_min", 0.60)
+        ),
+        "average_v23_offensive_activation_strength": float(
+            pd.to_numeric(
+                equity.get(
+                    "v23_offensive_activation_strength",
+                    pd.Series(dtype=float),
+                ),
+                errors="coerce",
+            ).mean()
+        ),
+        "v23_offensive_excluded_industries": list(
+            getattr(args, "v23_offensive_excluded_industries", []) or []
+        ),
+        "v23_participation_top_industries": int(
+            getattr(args, "v23_participation_top_industries", 0)
+        ),
+        "v23_participation_min_industry_stocks": int(
+            getattr(args, "v23_participation_min_industry_stocks", 20)
+        ),
+        "v23_participation_min_holdings": int(
+            getattr(args, "v23_participation_min_holdings", 0)
+        ),
+        "v23_defensive_group_industries": list(
+            getattr(args, "v23_defensive_group_industries", []) or []
+        ),
+        "v23_defensive_group_max_equity_fraction": float(
+            getattr(args, "v23_defensive_group_max_equity_fraction", 1.0)
+        ),
+        "v23_defensive_industry_max_holdings": int(
+            getattr(args, "v23_defensive_industry_max_holdings", 0)
         ),
         "v31_unknown_industry_cap_enforced": bool(
             getattr(args, "v31_enforce_unknown_industry_cap", False)
@@ -2646,6 +3907,30 @@ def make_summary(equity: pd.DataFrame, trades: pd.DataFrame, initial_cash: float
         "risk_mode": str(args.risk_mode),
         "risk_overlay_mode": str(
             getattr(args, "risk_overlay_mode", "disabled")
+        ),
+        "portfolio_optimization_mode": str(
+            getattr(args, "portfolio_optimization_mode", "baseline")
+        ),
+        "portfolio_optimization_applied_rebalances": int(
+            optimization_applied.sum()
+        ),
+        "average_portfolio_optimization_predicted_volatility_before": float(
+            pd.to_numeric(
+                equity.get(
+                    "portfolio_optimization_predicted_volatility_before",
+                    pd.Series(dtype=float),
+                ),
+                errors="coerce",
+            ).mean()
+        ),
+        "average_portfolio_optimization_predicted_volatility_after": float(
+            pd.to_numeric(
+                equity.get(
+                    "portfolio_optimization_predicted_volatility_after",
+                    pd.Series(dtype=float),
+                ),
+                errors="coerce",
+            ).mean()
         ),
         "risk_calibration_multiplier": float(
             getattr(args, "risk_calibration_multiplier", 1.0)
@@ -2947,6 +4232,17 @@ def connect_market_database(args) -> sqlite3.Connection:
 
 
 def run_backtest(args):
+    portfolio_optimization_mode = str(
+        getattr(args, "portfolio_optimization_mode", "baseline")
+    ).strip().lower()
+    if (
+        portfolio_optimization_mode != "baseline"
+        and str(getattr(args, "risk_overlay_mode", "disabled")) != "disabled"
+    ):
+        raise ValueError(
+            "Use either --portfolio-optimization-mode or --risk-overlay-mode, "
+            "not both in the same candidate."
+        )
     conn = connect_market_database(args)
     previous_sigint = None
     feature_cache: Optional[FeatureSnapshotCache] = None
@@ -2956,6 +4252,9 @@ def run_backtest(args):
     v31_factor_state_store: Optional[MonthlyFactorStateStore] = None
     v22_satellite_controller: Optional[IndustrySatelliteController] = None
     risk_calibration_store: Optional[CausalRiskCalibrationStore] = None
+    optimizer_calibration_store: Optional[
+        CausalPortfolioCalibrationStore
+    ] = None
     opening_gap_estimator: Optional[CausalOpeningGapEstimator] = None
     try:
         dates = base.trading_dates(conn)
@@ -2965,10 +4264,6 @@ def run_backtest(args):
             raise ValueError("No test dates in requested range.")
         prehistory = max(int(args.feature_history_days), int(args.min_history_days) + 30, 320)
         history_start = dates[max(0, date_to_index[test_dates[0]] - prehistory)]
-        prices = base.load_prices(conn, history_start, test_dates[-1])
-        prices["code"] = prices["code"].astype(str).str.zfill(6)
-        financial = base.load_financial_factors(conn)
-        industry_events = base.load_industry_event_scores(args.industry_event_scores)
         feature_cache_path = getattr(args, "feature_cache", None)
         before_feature_cache_path = getattr(
             args, "feature_cache_before_cutover", None
@@ -2987,6 +4282,11 @@ def run_backtest(args):
                 Path(args.database_before_cutover),
             )
             after_fingerprint = feature_cache_fingerprint(args)
+            before_legacy_fingerprint = legacy_feature_cache_fingerprint(
+                args,
+                Path(args.database_before_cutover),
+            )
+            after_legacy_fingerprint = legacy_feature_cache_fingerprint(args)
             feature_cache = SplitFeatureSnapshotCache(
                 Path(before_feature_cache_path),
                 Path(feature_cache_path),
@@ -2994,27 +4294,99 @@ def run_backtest(args):
                 before_fingerprint,
                 after_fingerprint,
             )
+            before_alias = feature_cache.before.register_legacy_alias(
+                before_fingerprint, before_legacy_fingerprint
+            )
+            after_alias = feature_cache.after.register_legacy_alias(
+                after_fingerprint, after_legacy_fingerprint
+            )
+            if before_alias or after_alias:
+                print(
+                    "Registered compatible V1 feature-cache aliases for the "
+                    "stable V2 fingerprint.",
+                    flush=True,
+                )
             cache_fingerprint = feature_cache.combined_fingerprint
         elif feature_cache_path:
             feature_cache = FeatureSnapshotCache(Path(feature_cache_path))
             cache_fingerprint = feature_cache_fingerprint(args)
+            if feature_cache.register_legacy_alias(
+                cache_fingerprint, legacy_feature_cache_fingerprint(args)
+            ):
+                print(
+                    "Registered a compatible V1 feature-cache alias for the "
+                    "stable V2 fingerprint.",
+                    flush=True,
+                )
+
+        scheduled_dates = []
+        all_decision_dates = []
+        for offset, trade_date in enumerate(test_dates):
+            decision_date = dates[date_to_index[trade_date] - 1]
+            all_decision_dates.append(decision_date)
+            if should_rebalance_on_date(
+                args.rebalance_schedule,
+                offset,
+                args.rebalance_every_n_days,
+                dates,
+                date_to_index,
+                decision_date,
+            ):
+                scheduled_dates.append(decision_date)
+        scheduled_dates = list(dict.fromkeys(scheduled_dates))
+        all_decision_dates = list(dict.fromkeys(all_decision_dates))
+        cache_required_dates = (
+            scheduled_dates
+            if str(getattr(args, "risk_rebalance_schedule", "daily"))
+            .strip()
+            .lower()
+            == "scheduled_only"
+            else all_decision_dates
+        )
+        missing_feature_dates = list(cache_required_dates)
+        if feature_cache is not None and cache_fingerprint is not None:
+            missing_feature_dates = feature_cache.missing_dates(
+                cache_fingerprint, cache_required_dates
+            )
+        feature_cache_complete = (
+            feature_cache is not None
+            and cache_fingerprint is not None
+            and not missing_feature_dates
+        )
+        print(
+            "Feature cache coverage: "
+            f"{len(cache_required_dates) - len(missing_feature_dates)}/"
+            f"{len(cache_required_dates)} required snapshots",
+            flush=True,
+        )
+
+        prices: Optional[pd.DataFrame] = None
+        financial = pd.DataFrame()
+        industry_events = pd.DataFrame()
+        price_access_mode = "compact_in_memory"
+        if bool(getattr(args, "build_feature_cache_only", False)) or not feature_cache_complete:
+            prices = load_price_columns(
+                conn, history_start, test_dates[-1], FULL_PRICE_COLUMNS
+            )
+            financial = base.load_financial_factors(conn)
+            industry_events = base.load_industry_event_scores(
+                args.industry_event_scores
+            )
+            print(
+                f"Price access mode: compact in-memory history ({len(prices):,} rows)",
+                flush=True,
+            )
+        else:
+            price_access_mode = "sqlite_daily_streaming"
+            print(
+                "Price access mode: indexed SQLite daily streaming; "
+                "raw factor history skipped",
+                flush=True,
+            )
 
         if bool(getattr(args, "build_feature_cache_only", False)):
             if feature_cache is None or cache_fingerprint is None:
                 raise ValueError("--build-feature-cache-only requires --feature-cache.")
-            scheduled_dates = []
-            for offset, trade_date in enumerate(test_dates):
-                decision_date = dates[date_to_index[trade_date] - 1]
-                if should_rebalance_on_date(
-                    args.rebalance_schedule,
-                    offset,
-                    args.rebalance_every_n_days,
-                    dates,
-                    date_to_index,
-                    decision_date,
-                ):
-                    scheduled_dates.append(decision_date)
-            scheduled_dates = list(dict.fromkeys(scheduled_dates))
             print(
                 f"Feature cache: {feature_cache.path} "
                 f"({feature_cache.count(cache_fingerprint)} snapshots already present)",
@@ -3039,19 +4411,78 @@ def run_backtest(args):
                 f"Feature cache complete: {len(scheduled_dates)} scheduled snapshots.",
                 flush=True,
             )
+            market_fingerprint = market_state_fingerprint(
+                args, history_start, test_dates[-1]
+            )
+            market_state = feature_cache.get_market_state(market_fingerprint)
+            if market_state is None:
+                market_state = build_compact_market_state(prices, args)
+                feature_cache.put_market_state(market_fingerprint, market_state)
+                print(
+                    f"Market-state cache built: {len(market_state):,} trading days",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Market-state cache hit: {len(market_state):,} trading days",
+                    flush=True,
+                )
             return {
                 "feature_cache": str(feature_cache.path),
                 "feature_cache_fingerprint": cache_fingerprint,
                 "snapshot_count": len(scheduled_dates),
+                "market_state_fingerprint": market_fingerprint,
             }
 
-        market_state = base.build_market_state(prices, args)
-        all_prices_by_date = PriceDateStore(
-            prices,
-            max_cached_dates=int(getattr(args, "price_date_cache_days", 32)),
+        market_fingerprint = market_state_fingerprint(
+            args, history_start, test_dates[-1]
+        )
+        market_state = (
+            feature_cache.get_market_state(market_fingerprint)
+            if feature_cache is not None
+            else None
+        )
+        market_state_cache_hit = market_state is not None
+        if market_state is None:
+            market_prices = prices
+            owns_market_prices = market_prices is None
+            if market_prices is None:
+                market_prices = load_price_columns(
+                    conn, history_start, test_dates[-1], MARKET_PRICE_COLUMNS
+                )
+            market_state = build_compact_market_state(market_prices, args)
+            if feature_cache is not None:
+                feature_cache.put_market_state(market_fingerprint, market_state)
+            if owns_market_prices:
+                del market_prices
+                gc.collect()
+            print(
+                f"Market-state cache built: {len(market_state):,} trading days",
+                flush=True,
+            )
+        else:
+            print(
+                f"Market-state cache hit: {len(market_state):,} trading days",
+                flush=True,
+            )
+
+        price_cache_days = int(getattr(args, "price_date_cache_days", 32))
+        all_prices_by_date = (
+            SQLitePriceDateStore(
+                conn,
+                max_cached_dates=price_cache_days,
+            )
+            if feature_cache_complete
+            else PriceDateStore(
+                prices,
+                max_cached_dates=price_cache_days,
+            )
         )
         event_regime = base.load_event_regime_signals(args.event_regime_signals)
-        if str(getattr(args, "risk_overlay_mode", "disabled")) != "disabled":
+        if (
+            str(getattr(args, "risk_overlay_mode", "disabled")) != "disabled"
+            or portfolio_optimization_mode != "baseline"
+        ):
             if not getattr(args, "risk_model_database", None):
                 raise ValueError(
                     "Risk overlay requires --risk-model-database."
@@ -3060,6 +4491,10 @@ def run_backtest(args):
             if getattr(args, "risk_calibration_schedule", None):
                 risk_calibration_store = CausalRiskCalibrationStore(
                     args.risk_calibration_schedule
+                )
+            if getattr(args, "optimizer_calibration_schedule", None):
+                optimizer_calibration_store = CausalPortfolioCalibrationStore(
+                    args.optimizer_calibration_schedule
                 )
 
         score_profile = str(
@@ -3176,7 +4611,54 @@ def run_backtest(args):
                 seed_date = dates[date_to_index[first_trade_date] - 1]
             else:
                 seed_date = test_dates[-1]
-            opening_gap_estimator.seed_from_frame(prices, seed_date)
+            opening_fingerprint = opening_gap_state_fingerprint(
+                args, history_start, seed_date, opening_gap_estimator
+            )
+            opening_state = (
+                feature_cache.get_opening_gap_state(opening_fingerprint)
+                if feature_cache is not None
+                else None
+            )
+            opening_gap_cache_hit = opening_state is not None
+            if opening_state is not None:
+                restore_opening_gap_estimator(
+                    opening_gap_estimator, opening_state
+                )
+                print(
+                    "Opening-gap cache hit: "
+                    f"{len(opening_gap_estimator.stock_gaps):,} stocks",
+                    flush=True,
+                )
+            else:
+                opening_seed_prices = prices
+                owns_opening_seed_prices = opening_seed_prices is None
+                if opening_seed_prices is None:
+                    opening_seed_prices = load_opening_seed_prices(
+                        conn,
+                        history_start,
+                        seed_date,
+                        lookback_days=opening_gap_estimator.lookback_days,
+                        max_absolute_gap=opening_gap_estimator.max_absolute_gap,
+                    )
+                opening_gap_estimator.seed_from_frame(
+                    opening_seed_prices, seed_date
+                )
+                if feature_cache is not None:
+                    feature_cache.put_opening_gap_state(
+                        opening_fingerprint,
+                        serialize_opening_gap_estimator(opening_gap_estimator),
+                    )
+                if owns_opening_seed_prices:
+                    del opening_seed_prices
+                    gc.collect()
+                print(
+                    "Opening-gap cache built: "
+                    f"{len(opening_gap_estimator.stock_gaps):,} stocks",
+                    flush=True,
+                )
+        else:
+            opening_gap_cache_hit = False
+            opening_fingerprint = None
 
         pause_requested = False
 
@@ -3304,8 +4786,12 @@ def run_backtest(args):
                     args,
                     decision_date=decision_date,
                     satellite_controller=v22_satellite_controller,
-                    market_risk_on_strength=v22_market_risk_on_strength(
-                        regime, args
+                    market_risk_on_strength=(
+                        v22_market_risk_on_strength(regime, args)
+                        * v23_offensive_activation_strength(regime, args)
+                    ),
+                    offensive_activation_strength=(
+                        v23_offensive_activation_strength(regime, args)
                     ),
                 )
                 expected_return_per_score = 0.0
@@ -3338,27 +4824,86 @@ def run_backtest(args):
                                 decision_date,
                                 default=calibration_multiplier,
                             )
-                        weights, metadata = apply_store_overlay(
-                            risk_store,
-                            decision_date,
-                            desired,
-                            stock_cap=effective_stock_cap,
-                            maximum_industry_fraction=float(
-                                args.risk_model_max_industry_weight
-                            ),
-                            strength=float(args.risk_overlay_strength),
-                            target_volatility=float(
-                                args.target_portfolio_volatility
-                            ),
-                            calibration_multiplier=calibration_multiplier,
-                            minimum_equity_scale=float(
-                                args.risk_overlay_min_equity_scale
-                            ),
-                            maximum_staleness_days=int(
-                                args.risk_model_max_staleness_days
-                            ),
-                            iterations=int(args.risk_overlay_iterations),
-                        )
+                        if portfolio_optimization_mode != "baseline":
+                            weights, metadata = apply_store_portfolio_optimization(
+                                risk_store,
+                                decision_date,
+                                desired,
+                                current_weights,
+                                _frame,
+                                mode=portfolio_optimization_mode,
+                                stock_cap=effective_stock_cap,
+                                maximum_industry_fraction=float(
+                                    args.risk_model_max_industry_weight
+                                ),
+                                alpha_scale=float(args.optimizer_alpha_scale),
+                                risk_aversion=float(args.optimizer_risk_aversion),
+                                tracking_penalty=float(
+                                    args.optimizer_tracking_penalty
+                                ),
+                                turnover_penalty=float(
+                                    args.optimizer_turnover_penalty
+                                ),
+                                risk_parity_budget_mode=str(
+                                    args.risk_parity_budget_mode
+                                ),
+                                risk_parity_damping=float(
+                                    args.risk_parity_damping
+                                ),
+                                black_litterman_tau=float(
+                                    args.black_litterman_tau
+                                ),
+                                black_litterman_view_confidence=float(
+                                    args.black_litterman_view_confidence
+                                ),
+                                calibration_multiplier=calibration_multiplier,
+                                maximum_staleness_days=int(
+                                    args.risk_model_max_staleness_days
+                                ),
+                                iterations=int(args.portfolio_optimizer_iterations),
+                                tolerance=float(args.portfolio_optimizer_tolerance),
+                                calibration_store=optimizer_calibration_store,
+                                parameter_mode=str(args.optimizer_parameter_mode),
+                                risk_aversion_mode=str(
+                                    args.optimizer_risk_aversion_mode
+                                ),
+                                calibration_max_staleness_days=int(
+                                    args.optimizer_calibration_max_staleness_days
+                                ),
+                                turnover_penalty_mode=str(
+                                    args.optimizer_turnover_penalty_mode
+                                ),
+                                portfolio_value=previous_total,
+                                broker_commission_rate=float(
+                                    args.broker_commission_rate
+                                ),
+                                broker_minimum_commission=float(
+                                    args.broker_minimum_commission
+                                ),
+                                slippage_bps=float(args.slippage_bps),
+                            )
+                        else:
+                            weights, metadata = apply_store_overlay(
+                                risk_store,
+                                decision_date,
+                                desired,
+                                stock_cap=effective_stock_cap,
+                                maximum_industry_fraction=float(
+                                    args.risk_model_max_industry_weight
+                                ),
+                                strength=float(args.risk_overlay_strength),
+                                target_volatility=float(
+                                    args.target_portfolio_volatility
+                                ),
+                                calibration_multiplier=calibration_multiplier,
+                                minimum_equity_scale=float(
+                                    args.risk_overlay_min_equity_scale
+                                ),
+                                maximum_staleness_days=int(
+                                    args.risk_model_max_staleness_days
+                                ),
+                                iterations=int(args.risk_overlay_iterations),
+                            )
                         metadata.update(calibration_metadata)
                         return weights, metadata
                 targets, target_meta = build_targets_v2(
@@ -3462,7 +5007,12 @@ def run_backtest(args):
                     "market_state": regime["market_state"],
                     "market_index": regime["market_index"],
                     "market_breadth": regime["market_breadth"],
+                    "market_return_5": regime.get("market_return_5", np.nan),
+                    "market_return_10": regime.get("market_return_10", np.nan),
                     "market_return_20": regime["market_return_20"],
+                    "market_up_breadth_5": regime.get(
+                        "market_up_breadth_5", np.nan
+                    ),
                     "market_volatility_20": regime["market_volatility_20"],
                     "trend_signal": regime.get("trend_signal", np.nan),
                     "vol_scale": regime.get("vol_scale", np.nan),
@@ -3543,6 +5093,10 @@ def run_backtest(args):
                         "v31_alpha_tilt_weight",
                         float(getattr(args, "v31_alpha_tilt_weight", 0.0)),
                     ),
+                    "v23_offensive_activation_strength": target_meta.get(
+                        "v23_offensive_activation_strength",
+                        v23_offensive_activation_strength(regime, args),
+                    ),
                     "v22_satellite_weight": target_meta.get(
                         "v22_satellite_weight", np.nan
                     ),
@@ -3603,6 +5157,53 @@ def run_backtest(args):
                         "risk_volatility_scale", np.nan
                     ),
                     "risk_cap_met": target_meta.get("risk_cap_met"),
+                    "portfolio_optimization_status": str(
+                        target_meta.get(
+                            "portfolio_optimization_status", "not_applied"
+                        )
+                    ),
+                    "portfolio_optimization_mode": str(
+                        target_meta.get(
+                            "portfolio_optimization_mode",
+                            portfolio_optimization_mode,
+                        )
+                    ),
+                    "portfolio_optimization_model_date": target_meta.get(
+                        "portfolio_optimization_model_date"
+                    ),
+                    "portfolio_optimization_predicted_volatility_before": target_meta.get(
+                        "portfolio_optimization_predicted_volatility_before", np.nan
+                    ),
+                    "portfolio_optimization_predicted_volatility_after": target_meta.get(
+                        "portfolio_optimization_predicted_volatility_after", np.nan
+                    ),
+                    "portfolio_optimization_one_way_turnover_proxy": target_meta.get(
+                        "portfolio_optimization_one_way_turnover_proxy", np.nan
+                    ),
+                    "portfolio_optimization_alpha_scale": target_meta.get(
+                        "portfolio_optimization_alpha_scale", np.nan
+                    ),
+                    "portfolio_optimization_risk_aversion": target_meta.get(
+                        "portfolio_optimization_risk_aversion", np.nan
+                    ),
+                    "optimizer_calibration_status": target_meta.get(
+                        "optimizer_calibration_status"
+                    ),
+                    "optimizer_calibration_as_of_date": target_meta.get(
+                        "optimizer_calibration_as_of_date"
+                    ),
+                    "optimizer_calibration_observations": target_meta.get(
+                        "optimizer_calibration_observations", 0
+                    ),
+                    "optimizer_turnover_penalty_mean": target_meta.get(
+                        "optimizer_turnover_penalty_mean", np.nan
+                    ),
+                    "black_litterman_tau": target_meta.get(
+                        "black_litterman_tau", np.nan
+                    ),
+                    "black_litterman_view_confidence": target_meta.get(
+                        "black_litterman_view_confidence", np.nan
+                    ),
                     **execution_diagnostics,
                 }
             )
@@ -3659,6 +5260,20 @@ def run_backtest(args):
             ]
         )
         summary = make_summary(equity, trades, float(args.initial_cash), final_total, args)
+        summary.update(
+            {
+                "price_access_mode": price_access_mode,
+                "feature_cache_complete_at_start": bool(feature_cache_complete),
+                "feature_cache_required_snapshots": int(len(cache_required_dates)),
+                "feature_cache_missing_snapshots_at_start": int(
+                    len(missing_feature_dates)
+                ),
+                "market_state_cache_hit_at_start": bool(market_state_cache_hit),
+                "market_state_fingerprint": market_fingerprint,
+                "opening_gap_cache_hit_at_start": bool(opening_gap_cache_hit),
+                "opening_gap_fingerprint": opening_fingerprint,
+            }
+        )
         paths = write_outputs_v2(
             equity,
             trades,
@@ -3728,6 +5343,9 @@ def parse_args(argv=None):
         choices=["v2h4_legacy", "china_small_v3", "v31"],
         default="v2h4_legacy",
     )
+    parser.add_argument("--v2-component-weights", type=json.loads)
+    parser.add_argument("--neural-factor-model", type=Path)
+    parser.add_argument("--neural-factor-tilt-weight", type=float, default=0.0)
     parser.add_argument(
         "--portfolio-constructor",
         choices=["legacy", "integer_cost_aware"],
@@ -3804,6 +5422,7 @@ def parse_args(argv=None):
         default="auto",
     )
     parser.add_argument("--v31-alpha-tilt-weight", type=float, default=0.0)
+    parser.add_argument("--v31-alpha-component-weights", type=json.loads)
     parser.add_argument("--v31-industry-cap-deviation", type=float, default=0.04)
     parser.add_argument("--v31-absolute-industry-cap", type=float, default=0.25)
     parser.add_argument("--v31-unknown-industry-cap", type=float, default=0.05)
@@ -3836,6 +5455,55 @@ def parse_args(argv=None):
     parser.add_argument("--v22-pure-industry-trend", action="store_true")
     parser.add_argument(
         "--v22-industry-satellite-max-weight", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--v23-offensive-alpha-tilt-weight", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--v23-offensive-activation-mode",
+        choices=["always", "fast_rebound"],
+        default="always",
+    )
+    parser.add_argument(
+        "--v23-fast-rebound-return-5-min", type=float, default=0.03
+    )
+    parser.add_argument(
+        "--v23-fast-rebound-return-10-min", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--v23-fast-rebound-return-20-max", type=float, default=0.02
+    )
+    parser.add_argument(
+        "--v23-fast-rebound-up-breadth-5-min", type=float, default=0.60
+    )
+    parser.add_argument(
+        "--v23-offensive-excluded-industries",
+        type=json.loads,
+        default=[],
+        help=(
+            "JSON list of CSRC top-level industries that may remain in the core "
+            "but cannot receive the V2.3 offensive-participation bonus."
+        ),
+    )
+    parser.add_argument("--v23-participation-top-industries", type=int, default=0)
+    parser.add_argument(
+        "--v23-participation-min-industry-stocks", type=int, default=20
+    )
+    parser.add_argument("--v23-participation-min-holdings", type=int, default=0)
+    parser.add_argument(
+        "--v23-defensive-group-industries",
+        type=json.loads,
+        default=[],
+        help=(
+            "JSON list of industries whose combined weight may be capped in "
+            "V2.3 candidate portfolios."
+        ),
+    )
+    parser.add_argument(
+        "--v23-defensive-group-max-equity-fraction", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--v23-defensive-industry-max-holdings", type=int, default=0
     )
     parser.add_argument(
         "--v22-industry-satellite-top-industries", type=int, default=2
@@ -3918,6 +5586,48 @@ def parse_args(argv=None):
         "--risk-model-max-staleness-days", type=int, default=14
     )
     parser.add_argument("--risk-overlay-iterations", type=int, default=80)
+
+    # Alternative portfolio optimizers. These reweight the existing selected pool.
+    parser.add_argument(
+        "--portfolio-optimization-mode",
+        choices=["baseline", "mean_variance", "risk_parity", "black_litterman"],
+        default="baseline",
+    )
+    parser.add_argument("--optimizer-alpha-scale", type=float, default=0.04)
+    parser.add_argument("--optimizer-risk-aversion", type=float, default=3.0)
+    parser.add_argument("--optimizer-tracking-penalty", type=float, default=0.02)
+    parser.add_argument("--optimizer-turnover-penalty", type=float, default=0.003)
+    parser.add_argument(
+        "--optimizer-parameter-mode",
+        choices=["fixed", "causal"],
+        default="fixed",
+    )
+    parser.add_argument(
+        "--optimizer-risk-aversion-mode",
+        choices=["fixed", "market_implied"],
+        default="fixed",
+    )
+    parser.add_argument(
+        "--optimizer-turnover-penalty-mode",
+        choices=["fixed", "estimated"],
+        default="fixed",
+    )
+    parser.add_argument("--optimizer-calibration-schedule", type=Path)
+    parser.add_argument(
+        "--optimizer-calibration-max-staleness-days", type=int, default=120
+    )
+    parser.add_argument("--portfolio-optimizer-iterations", type=int, default=120)
+    parser.add_argument("--portfolio-optimizer-tolerance", type=float, default=1e-8)
+    parser.add_argument(
+        "--risk-parity-budget-mode",
+        choices=["equal", "baseline"],
+        default="equal",
+    )
+    parser.add_argument("--risk-parity-damping", type=float, default=0.50)
+    parser.add_argument("--black-litterman-tau", type=float, default=0.05)
+    parser.add_argument(
+        "--black-litterman-view-confidence", type=float, default=0.35
+    )
 
     # Base market-state arguments retained for --risk-mode legacy only.
     parser.add_argument("--disable-market-regime", action="store_true")
